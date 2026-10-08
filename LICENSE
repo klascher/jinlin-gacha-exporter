@@ -1,0 +1,15 @@
+LICENSE 占位说明（请替换为正式全文）
+================================
+
+本项目采用非商业许可：
+
+    SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+⚠️ 本文件是占位，请把 **PolyForm Noncommercial License 1.0.0** 的正式全文粘贴到此处：
+    https://polyformproject.org/licenses/noncommercial/1.0.0/
+
+并按该许可要求在显著位置保留如下声明（Required Notice）：
+
+    Required Notice: Copyright (c) 2026 klascher
+
+为什么不用 MIT / Apache-2.0：它们明确允许他人商业化，与本项目"非盈利"的意图相反。

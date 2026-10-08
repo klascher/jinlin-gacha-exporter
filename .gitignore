@@ -1,0 +1,19 @@
+# Python 产物
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# 运行期数据（users/logs/cache/settings 等由程序自建，绝不入库）
+gacha_exporter/data/users/
+gacha_exporter/data/logs/
+gacha_exporter/data/cache/
+gacha_exporter/data/*.json
+*.log
+
+# 本机配置
+.idea/
+.vscode/
