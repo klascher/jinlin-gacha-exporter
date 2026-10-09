@@ -95,7 +95,7 @@ class StatsEngine:
         # 这样 GUI 侧 mutate 同一对象（add/discard）后 engine 立即可见。
         self.records: List[GachaRecord] = []
         self._seen_batches: Set[tuple] = set()  # 已见过的批次指纹（同会话整页重发）
-        # **位置对齐去重**（见 docs/去重方案-位置对齐.md）：单次抓包**全收**，
+        # **位置对齐去重**（见 docs/去重归档/去重方案-位置对齐.md）：单次抓包**全收**，
         # 不做事件内去重（依据 B3 页互斥 + C5 页缓存），整页指纹仅作廉价兜底；
         # 跨会话的重复由 storage.history.merge 按 (timestamp, pos − Δ) 判定。
         # 这里维护**本次会话新增**的记录，供收尾时交给 history 做位置合并
@@ -111,7 +111,7 @@ class StatsEngine:
         self._shift_baseline_total: Optional[int] = None
         self._total_seen: Optional[int] = None
         self._known_positions: Set[Tuple[int, int]] = set()
-        # **事件级判重索引**（旧格式历史兼容，见 docs/去重方案-旧历史兼容-事件级判重.md）：
+        # **事件级判重索引**（旧格式历史兼容，见 docs/去重归档/去重方案-旧历史兼容-事件级判重.md）：
         # 历史（会话起点快照）中 size ∈ {1,10} 的完整事件，重抓时按 ts 整体实时跳过
         # ——完整事件的跨会话判重只看 ts，历史 pos 是页内坐标还是绝对坐标都无关；
         # 部分事件（size ∉ {1,10}）的记录照常收下，由收尾 merge 做替换/合并。
@@ -133,12 +133,11 @@ class StatsEngine:
         """总记录数。"""
         return len(self.records)
 
-    def add(self, records: List[GachaRecord], view: Optional[str] = None,
-            direction: int = 0) -> int:
+    def add(self, records: List[GachaRecord]) -> int:
         """收下本批记录；**实时判重两层：事件级（ts）+ 位置级（pos − Δ）**，返回收下的条数。
 
-        判定分层（位置对齐方案，见 `docs/去重方案-位置对齐.md`；
-        事件级判重见 `docs/去重方案-旧历史兼容-事件级判重.md`）：
+        判定分层（位置对齐方案，见 `docs/去重归档/去重方案-位置对齐.md`；
+        事件级判重见 `docs/去重归档/去重方案-旧历史兼容-事件级判重.md`）：
 
         - **事件级**：记录的 ts 命中历史**完整事件**（size ∈ {1,10}）→ 当场跳过。
           完整事件的跨会话判重只看 ts——历史 pos 是旧·页内坐标还是新·绝对坐标
@@ -157,9 +156,6 @@ class StatsEngine:
 
         Args:
             records: 新解析出的记录
-            view: 本批所属视图身份。**不再参与判定**，保留形参以兼容调用点
-                与既有测试（B8 已保证只有「全部卡池」入账）。
-            direction: 翻页方向。同上，保留形参但不再参与判定。
 
         Returns:
             本次收下的记录数

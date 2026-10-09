@@ -1,6 +1,6 @@
 """位置对齐去重 —— 单次抓包全收 + 跨会话按位置合并。
 
-设计见 `docs/去重方案-位置对齐.md`（v1）。核心一句话：
+设计见 `docs/去重归档/去重方案-位置对齐.md`（v1）。核心一句话：
 **把「内容模式去重」换成「位置模式去重」**——同一视图内 `position_in_batch` 是记录在
 列表里的绝对位置，同名记录位置不同，所以位置即身份，天然不会吞同名第二份。
 
@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from ..models import GachaRecord
 
 # 合法事件大小：1 = 单抽、10 = 十连（规则 A1；旧 event_ledger.VALID_EVENT_SIZES 同值，
-# 该模块已整体注释退役，见测试 test_event_ledger.py）
+# 该模块及其测试已于 2026-10-10 整体删除，历史见 docs/去重归档/）
 VALID_EVENT_SIZES = (1, 10)
 
 
@@ -52,7 +52,7 @@ class MergeReport:
     """位置命中历史、判为重复而跳过的条数。"""
 
     event_skipped: int = 0
-    """事件级判重跳过的**事件数**（旧格式历史兼容，见 docs/去重方案-旧历史兼容-事件级判重.md）。
+    """事件级判重跳过的**事件数**（旧格式历史兼容，见 docs/去重归档/去重方案-旧历史兼容-事件级判重.md）。
 
     历史中已存在的完整事件（size ∈ {1,10}）重抓时按 ts 整体跳过：同一次抽卡不会因
     坐标系不同（旧·页内坐标 vs 新·绝对坐标）变成两次抽卡，pos 不参与判定。"""

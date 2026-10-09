@@ -1112,8 +1112,6 @@ class MainWindow(QWidget):
             # 位置对齐方案：view/direction 已不参与判定（旧账本视图/方向信号退役，
             # direction_of 链路已注释，见 pool_view.__init__）。这里只传 records；
             # 实时判重由 stats 内部按 `(ts, pos − Δ)` 完成（Δ 见 _ensure_session_shift）
-            # --- 旧接线（view / direction_of(view) 两个实参）已注释保留 ---
-            # added = self.stats.add(kept, view, self._pool_tracker.direction_of(view))
             added = self.stats.add(kept)
             if added:
                 self.refresh_ui()

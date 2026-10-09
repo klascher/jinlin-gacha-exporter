@@ -1,6 +1,6 @@
 """旧版 history.json 兼容（事件级判重）测试。
 
-设计稿：docs/去重方案-旧历史兼容-事件级判重.md §5（T1~T6/T8/T9）。
+设计稿：docs/去重归档/去重方案-旧历史兼容-事件级判重.md §5（T1~T6/T8/T9）。
 
 旧格式特征（2026-09-13 实测 sample.json 解码）：total/view_totals 快照缺失；
 batch_seq=页取序号（每页 5 条一个 batch）、position_in_batch=页内序 0~4；
