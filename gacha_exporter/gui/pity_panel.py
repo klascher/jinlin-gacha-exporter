@@ -5,9 +5,9 @@
 每抽明细另走 main_window 的「查看明细」弹窗，平时不占空间。
 
 双视图（摘要栏右侧切换，2026-10-08 定稿）：「按卡池」= 上述现状；「按角色」=
-流水视图——组内每条六星出货一行「[UP·必出]/[UP]/[歪] 第N抽 角色名 池名 时间」，
+流水视图——组内每条六星出货一行「[UP]/[歪] 第N抽 角色名 池名 时间」（2026-10-10 去必出标注），
 不按池/角色聚合、无折叠层级，复刻（同角色复用 pool_id）的多期出货各成一行。
-见 展示设计说明 v0.2。
+见 docs/已完成/展示设计说明 v0.2。
 
 分组顺序由 StatsEngine.shared_pity_tracking() 的天然顺序决定（has_state 优先 + label
 排序）-> UP池 / 遴选池 / 常驻池 / 新手池（新手池在最下面）。组内卡池按 pool_id 号
@@ -184,20 +184,21 @@ class CollapsibleSection(QFrame):
 class HitRow(QFrame):
     """单条 6 星命中行：第N抽  [歪]/[UP]  角色名  时间（左缩进）。
 
-    featured 池显示 [UP]/[歪] 着色标记，大保底必出命中（guaranteed=True）
-    显示 [UP·必出]；非 featured（常驻/新手）不显示标记；
+    featured 池显示 [UP]/[歪] 着色标记；大保底必出不再单独标注（2026-10-10
+    用户拍板去「必出」，引擎 guaranteed 输出保留仅展示不用）；
+    非 featured（常驻/新手）不显示标记；
     manual=True 的角色名前加浅灰「手」标记（手动补齐），不抢 [UP]/[歪] 配色。
     """
 
     def __init__(self, pity: int, ts: int, name: str, is_up: bool, featured: bool,
-                 manual: bool = False, guaranteed: bool = False, parent=None):
+                 manual: bool = False, parent=None):
         super().__init__(parent)
         self.pity = pity
         self.ts = ts
         self.is_up = is_up
         self.featured = featured
         self.manual = manual
-        self.tag_label = None  # [UP·必出]/[UP]/[歪] QLabel（非 featured 池为 None）
+        self.tag_label = None  # [UP]/[歪] QLabel（非 featured 池为 None）
         self.manual_label = None  # 「手」QLabel（非手动为 None）
 
         lay = QHBoxLayout(self)
@@ -205,10 +206,7 @@ class HitRow(QFrame):
         lay.setSpacing(10)
         lay.addWidget(QLabel(f"第{pity}抽"))
         if featured:
-            if is_up:
-                tag_text = "[UP·必出]" if guaranteed else "[UP]"
-            else:
-                tag_text = "[歪]"
+            tag_text = "[UP]" if is_up else "[歪]"
             tag = QLabel(tag_text)
             tag.setStyleSheet(
                 "color: #2e8b57; font-weight: bold;" if is_up
@@ -232,7 +230,7 @@ class HitRow(QFrame):
 
 
 class FlowHitRow(QFrame):
-    """「按角色」流水视图单条出货行：[UP·必出]/[UP]/[歪]  第N抽  角色名  池名  时间。
+    """「按角色」流水视图单条出货行：[UP]/[歪]  第N抽  角色名  池名  时间。
 
     与按卡池视图的 HitRow 区别：标签在最前（用户定稿行序）、行尾多池名标注
     （复刻=同角色复用 pool_id，同一角色的多期出货靠池名+时间区分）、
@@ -242,7 +240,7 @@ class FlowHitRow(QFrame):
     """
 
     def __init__(self, pity: int, ts: int, name: str, pool_name: str,
-                 is_up: bool, featured: bool, guaranteed: bool = False, parent=None):
+                 is_up: bool, featured: bool, parent=None):
         super().__init__(parent)
         self.pity = pity
         self.ts = ts
@@ -250,17 +248,14 @@ class FlowHitRow(QFrame):
         self.pool_name = pool_name
         self.is_up = is_up
         self.featured = featured
-        self.tag_label = None  # [UP·必出]/[UP]/[歪] QLabel（非 featured 池为 None）
+        self.tag_label = None  # [UP]/[歪] QLabel（非 featured 池为 None）
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(_FOLD_INDENT, 0, 0, 0)
         lay.setSpacing(10)
-        # 标签列（固定宽）：featured 池显示 [UP·必出]/[UP]/[歪]，其余留空占位对齐
+        # 标签列（固定宽）：featured 池显示 [UP]/[歪]，其余留空占位对齐
         if featured:
-            if is_up:
-                tag_text = "[UP·必出]" if guaranteed else "[UP]"
-            else:
-                tag_text = "[歪]"
+            tag_text = "[UP]" if is_up else "[歪]"
             tag = QLabel(tag_text)
             tag.setStyleSheet(
                 "color: #2e8b57; font-weight: bold;" if is_up
@@ -269,7 +264,7 @@ class FlowHitRow(QFrame):
             self.tag_label = tag
         else:
             tag = QLabel("")
-        tag.setFixedWidth(_col_w("[UP·必出]"))
+        tag.setFixedWidth(_col_w("[UP]"))
         lay.addWidget(tag)
         pity_lbl = QLabel(f"第{pity}抽")
         pity_lbl.setFixedWidth(_col_w("第00抽"))
@@ -317,7 +312,6 @@ class PoolRow(QFrame):
                  hits: List[dict], wins: int = 0, all_up: int = 0,
                  collapsed: bool = False,
                  manual_ts_bound: Optional[int] = None,
-                 guaranteed_keys: Optional[set] = None,
                  on_toggle: Optional[Callable[[str, bool], None]] = None,
                  parent=None):
         super().__init__(parent)
@@ -329,8 +323,6 @@ class PoolRow(QFrame):
         self.unshipped_label = None  # 「未出六星」QLabel（出了六星则为 None）
         self.up_rate_label = None  # 「不歪率」QLabel（非 featured 池为 None）
         self.arrow_label = None  # ▾/▸ 折叠箭头 QLabel（始终创建占位；无命中池文本为空）
-        # 大保底必出命中键集合（non_warp_rates 输出），命中行据此显示 [UP·必出]
-        self.guaranteed_keys = guaranteed_keys if guaranteed_keys is not None else set()
         # 该池是否存在「手动补齐」的命中（hit.ts < 组最早真实ts）
         self.manual_ts_bound = manual_ts_bound
         self.has_manual = bool(
@@ -405,10 +397,6 @@ class PoolRow(QFrame):
                     manual=(
                         self.manual_ts_bound is not None
                         and h.get("ts", 0) < self.manual_ts_bound
-                    ),
-                    guaranteed=(
-                        (pool.id, h.get("ts", 0), h["pity"], h["name"])
-                        in self.guaranteed_keys
                     ),
                 ))
         outer.addWidget(self.body)
@@ -643,8 +631,6 @@ class PityPanel(QWidget):
             self._section_title(info, pools, rates),
             expanded=(label == "UP池"), show_bulk_toggle=show_bulk
         )
-        guaranteed_keys = rates["guaranteed"] if rates else set()
-
         # 组内池按 pool_id 号倒序 -> 号大（新卡池）在前，#1 = 最新
         pids = sorted(
             info["per_pool"].keys(),
@@ -668,7 +654,6 @@ class PityPanel(QWidget):
                 hits=pinfo["hits"],
                 collapsed=self._pool_collapsed.get(pid, pid != default_expanded_pid),
                 manual_ts_bound=manual_ts_bound,
-                guaranteed_keys=guaranteed_keys,
                 on_toggle=self._on_pool_toggled,
             ))
         return section
@@ -678,7 +663,7 @@ class PityPanel(QWidget):
                             manual_ts_bound: Optional[int] = None) -> CollapsibleSection:
         """构建「按角色」流水视图分组区块：组内每条 6 星出货一行，不聚合。
 
-        行格式 [UP·必出]/[UP]/[歪] 第N抽 角色名 池名 时间（时间新->旧）；
+        行格式 [UP]/[歪] 第N抽 角色名 池名 时间（时间新->旧；2026-10-10 去必出标注）；
         手动补齐「手」标记不进入流水视图（D10，manual_ts_bound 仅保持
         与 _build_section 同签名，不使用）。
         """
@@ -687,7 +672,6 @@ class PityPanel(QWidget):
             expanded=(info["label"] == "UP池"),
             show_bulk_toggle=False,
         )
-        guaranteed = rates["guaranteed"] if rates else set()
         hits = info["hits"]
         if not hits:
             hint = QLabel("未出六星")
@@ -709,9 +693,6 @@ class PityPanel(QWidget):
                 pool_name=h["pool_name"],
                 is_up=h["is_up"],
                 featured=pool.is_featured,
-                guaranteed=(
-                    (h["pool_id"], h.get("ts", 0), h["pity"], h["name"]) in guaranteed
-                ),
             ))
         return section
 

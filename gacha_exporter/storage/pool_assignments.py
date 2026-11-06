@@ -7,7 +7,8 @@ has_state 共享组，统计时与组内其他池一起跑共享保底。
 实现上不改统计算法：指派结果只是为陌生池合成一个带 pity_group 的 Pool，
 注入传给 StatsEngine 的 pools 映射，分组解析（resolve_groups）自然生效。
 仅对未收录的陌生池生效；元数据收录该池后真实配置自动覆盖，指派条目失效
-（无害）。跨账号全局，因为是卡池维度而非账号维度。
+（无害），启动时后台静默清掉已收录条目（cleanup_pool_assignments）。
+跨账号全局，因为是卡池维度而非账号维度。
 """
 import json
 import os
@@ -89,3 +90,22 @@ def apply_pool_assignments(
             pity_group=gkey,
         )
     return effective
+
+
+def cleanup_pool_assignments(pools: Dict[str, Pool]) -> int:
+    """启动清理：元数据（role.json/缓存）已收录的池，其指派条目清掉，返回清除数。
+
+    指派是给「元数据暂未收录的陌生池」打的临时补丁，收录后 apply_pool_assignments
+    本就会跳过（无害），这里做纯文件卫生：把已收录条目从文件里删掉，避免长期累积。
+    - 只在确有可清条目时写盘，无变化零写入（文件不存在时 load 返回空 dict，同样零写入）；
+    - 后台静默执行，仅日志，无用户可见反馈。
+    """
+    assignments = load_pool_assignments()
+    if not assignments:
+        return 0
+    stale = [pid for pid in assignments if pid in pools]
+    if not stale:
+        return 0
+    save_pool_assignments({pid: g for pid, g in assignments.items() if pid not in pools})
+    logger.info(f"卡池指派清理：已移除 {len(stale)} 条已收录池的指派: {sorted(stale)}")
+    return len(stale)

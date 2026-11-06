@@ -264,3 +264,37 @@ def save_capture_iface_learned(iface: str) -> None:
     data = _load_all()
     data["capture_iface_learned"] = iface if isinstance(iface, str) else ""
     _save_all(data)
+
+
+DEFAULT_RECOGNITION_ENABLED = True
+
+
+def load_recognition_enabled() -> bool:
+    """是否启用「未知角色本机识图」（2026-10-21 默认开启）。
+
+    只截本机屏幕、不上传；关闭后抓包仍照常，未知 id 只在停止时按旧流程提示。
+    """
+    v = _load_all().get("recognition_enabled", DEFAULT_RECOGNITION_ENABLED)
+    return v if isinstance(v, bool) else DEFAULT_RECOGNITION_ENABLED
+
+
+def save_recognition_enabled(enabled: bool) -> None:
+    """保存本机识图开关。"""
+    data = _load_all()
+    data["recognition_enabled"] = bool(enabled)
+    _save_all(data)
+
+
+def load_bool_setting(key: str, default: bool) -> bool:
+    """读取任意布尔设置；缺失/非 bool 返回 default。"""
+    v = _load_all().get(key, default)
+    return v if isinstance(v, bool) else default
+
+
+def save_bool_setting(key: str, value: bool) -> None:
+    """写入任意布尔设置。"""
+    data = _load_all()
+    data[key] = bool(value)
+    _save_all(data)
+
+

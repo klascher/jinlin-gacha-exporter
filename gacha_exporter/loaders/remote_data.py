@@ -17,6 +17,7 @@ import requests
 
 from ..models import Announcement, Character, DataNotReadyError, PityGroup, Pool, VersionInfo, parse_announcement, parse_character, parse_pity_groups, parse_pool, parse_version_info
 from ..utils.auth import build_auth_headers
+from .role_image import load_role_image
 from ..utils.logger import get_logger
 from ..utils.paths import get_cache_dir
 
@@ -205,8 +206,15 @@ def load_role_data(
     pools = {pid: parse_pool(pid, pdata) for pid, pdata in raw.get("pools", {}).items()}
     pity_groups = parse_pity_groups(raw.get("pity_groups", {}))
 
+    # 词条库独立于 role.json（data/role-image.json，见 loaders/role_image）：
+    # 展示时联动——role 出名字/星级，role-image 出词条翻译。
+    lib_map = load_role_image()
+    for cid, ch in characters.items():
+        ch.lib = lib_map.get(cid)
+
     logger.info(
-        f"加载角色 {len(characters)} 个，卡池 {len(pools)} 个，保底分组 {len(pity_groups)} 个，remote_ok={remote_ok}"
+        f"加载角色 {len(characters)} 个（词条库覆盖 {sum(1 for c in characters.values() if c.lib)} 个），"
+        f"卡池 {len(pools)} 个，保底分组 {len(pity_groups)} 个，remote_ok={remote_ok}"
     )
     return characters, pools, pity_groups, remote_ok
 
@@ -240,6 +248,29 @@ def resolve_appzip_url(update_url: str) -> str:
         base = role_url.rsplit("/", 1)[0]  # 去掉末段（/role）
         return base + "/app.zip"
     return update_url
+
+
+def resolve_runtime_url(module: str, runtime_url: str = "") -> str:
+    """功能组件包地址（按模块）：环境变量优先，其次按本地联调 base 推导。
+
+    - ``JINLIN_RUNTIME_URL``：以 ``/`` 结尾视为目录，拼 ``<模块>.zip``；
+      否则视为所有模块共用的完整地址（单模块联调/测试用）。
+    - 设置 ``JINLIN_ROLE_URL`` 时用同 base 的 ``runtime/<模块>.zip``，
+      避免本地联调仍从生产域名下载 75MB 组件包。
+    - 都没有则用 version.json 下发的 ``runtime_url``。
+
+    与 resolve_appzip_url 同思路；`module` 必传，防止旧调用把 URL 当模块名。
+    """
+    env = os.environ.get("JINLIN_RUNTIME_URL")
+    if env:
+        if env.endswith("/"):
+            return env + f"{module}.zip"
+        return env
+    role_url = os.environ.get("JINLIN_ROLE_URL")
+    if role_url:
+        base = role_url.rsplit("/", 1)[0]
+        return f"{base}/runtime/{module}.zip"
+    return runtime_url
 
 
 def load_version_info() -> VersionInfo | None:

@@ -124,3 +124,77 @@ def test_parse_version_info_roundtrips_update_signature():
     assert info2.update_signature == ""
     info3 = parse_version_info({"latest_version": "0.2.3", "update_signature": 123})
     assert info3.update_signature == ""
+
+
+def test_parse_version_info_runtime_modules():
+    """runtimes 模块表：合法项保留，非法模块名/缺版本号跳过，字段类型校验。"""
+    info = parse_version_info({
+        "latest_version": "0.5.0",
+        "runtimes": {
+            "ocr": {
+                "label": "视觉识别组件",
+                "version": "1.2.0",
+                "url": "https://example/runtime/ocr.zip",
+                "sha256": "abc",
+                "signature": "sig",
+                "size": 12345,
+                "requires": [],
+            },
+            "training": {
+                "version": "1.0.0",
+                "sha256": "def",
+                "signature": "sig2",
+                "size": "678",
+                "requires": ["ocr"],
+            },
+            "Bad-Name": {"version": "1.0.0"},   # 非法模块名 -> 跳过
+            "team_builder": {"version": ""},     # 缺版本号 -> 跳过
+            "nope": "not-a-dict",                # 非对象 -> 跳过
+        },
+    })
+    assert set(info.runtimes) == {"ocr", "training"}
+    ocr = info.runtime("ocr")
+    assert ocr.label == "视觉识别组件"
+    assert ocr.version == "1.2.0"
+    assert ocr.url == "https://example/runtime/ocr.zip"
+    assert ocr.sha256 == "abc"
+    assert ocr.signature == "sig"
+    assert ocr.size == 12345
+    training = info.runtime("training")
+    assert training.size == 678  # 字符串数字转 int
+    assert training.requires == ("ocr",)
+    assert info.runtime("nope") is None
+
+    missing = parse_version_info({"latest_version": "0.5.0"})
+    assert missing.runtimes == {}
+
+
+def test_parse_version_info_legacy_runtime_fields_map_to_ocr():
+    """旧单模块字段 runtime_* 兼容映射为 runtimes['ocr']（新字段优先）。"""
+    info = parse_version_info({
+        "latest_version": "0.5.0",
+        "runtime_version": "1.2.0",
+        "runtime_url": "https://example/runtime.zip",
+        "runtime_sha256": "abc",
+        "runtime_signature": "sig",
+        "runtime_size": 12345,
+    })
+    ocr = info.runtime("ocr")
+    assert ocr is not None
+    assert ocr.version == "1.2.0"
+    assert ocr.url == "https://example/runtime.zip"
+    assert ocr.sha256 == "abc"
+    assert ocr.signature == "sig"
+    assert ocr.size == 12345
+
+    # 新 runtimes.ocr 存在时忽略旧字段，避免双源
+    both = parse_version_info({
+        "latest_version": "0.5.0",
+        "runtime_version": "0.9.0",
+        "runtimes": {"ocr": {"version": "1.0.0"}},
+    })
+    assert both.runtime("ocr").version == "1.0.0"
+
+    # 旧字段类型非法 -> 不生成 ocr 条目
+    bad = parse_version_info({"latest_version": "0.5.0", "runtime_version": 5})
+    assert bad.runtime("ocr") is None

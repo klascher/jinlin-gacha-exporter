@@ -3,11 +3,12 @@ import logging
 import os
 import time
 import webbrowser
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from PySide6.QtCore import QThread, QTimer
 from PySide6.QtGui import QActionGroup
 from PySide6.QtWidgets import (
     QApplication,
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QSystemTrayIcon,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -31,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from ..analysis.manual_patches import build_patched_engine, compute_editable, synthesize_records
 from ..analysis.parser import GachaParser
+# 练度功能已下线（2026-10-19，课题终审结案后产品侧撤下）：from ..analysis.roster_capture import RosterCapture
 from ..analysis.pool_view import (
     LIST_TYPE_ALL,
     LIST_TYPE_LABELS,
@@ -40,6 +44,8 @@ from ..analysis.pool_view import (
     split_view,
 )
 from ..analysis.stats import StatsEngine
+from ..analysis.unknown_trigger import RecognitionTask, UnknownRecognitionTrigger
+from ..capture.screen_grab import ScreenGrabError, grab_game_screen
 from ..debug_flags import is_debug_capture_enabled
 from ..exporters.excel import export_excel
 from ..models import CaptureConfig, Character, GachaRecord, PityGroup, Pool, SessionContext
@@ -52,18 +58,24 @@ from ..storage.pool_assignments import (
     save_pool_assignments,
 )
 from ..storage.profiles import ProfileManager
+from ..storage.role_overlay import merge_into as merge_role_overlay
 from ..storage import sync_apply, sync_file
+# 练度功能已下线（2026-10-19）：from .roster_panel import RosterPanel
 from ..storage.settings import (
     load_capture_iface,
     load_discovered_addresses,
     load_last_capture,
+    load_recognition_enabled,
     save_capture_iface,
     save_discovered_addresses,
     save_last_capture,
+    save_recognition_enabled,
 )
 from ..utils.helpers import safe_filename
 from ..utils.net_iface import IFACE_AUTO, list_capture_ifaces, resolve_capture_iface
 from ..utils.logger import get_logger
+from ..utils import host_env
+from .. import features
 from .. import __version__
 from .app_icon import app_icon
 from .branding import sponsor_label, faq_label
@@ -72,6 +84,9 @@ from .discovery_dialog import DiscoveryDialog
 from .maintenance_dialog import MaintenanceDialog
 from .npcap_dialog import NPCAP_DOWNLOAD_URL, NpcapDependencyDialog, find_bundled_npcap_installer
 from .pity_panel import PityPanel
+from .recognition_dialog import OverlayManagerDialog, RecognitionDialog
+from .recognition_worker import RecognitionWorker
+from .runtime_dialog import RuntimeUpdateDialog
 from .record_table import RecordTable
 from .settings_dialog import SettingsDialog
 from .sync_dialog import (
@@ -169,6 +184,12 @@ class MainWindow(QWidget):
         self._active_profile_id = profiles.active_id()
         self._shields = load_shields()  # 陌生ID屏蔽集（跨账号全局，角色维度）
         self._pool_assignments = load_pool_assignments()  # 陌生池->共享组指派（跨账号全局）
+        # 视觉识别确认结果（本地覆盖层，2026-10-21）：先注入角色/卡池映射，再
+        # 合成生效池——远端已收录的同 id 由 merge_into 自动清理（远端优先）。
+        # 记录注入前 id 集，供「本机识别结果」删除后判断哪些条目来自 overlay。
+        self._base_character_ids = set(self.characters)
+        self._base_pool_ids = set(self.pools)
+        merge_role_overlay(self.characters, self.pools)
         # 生效池映射 = 元数据池 + 陌生池指派合成的 Pool；统计/展示/导出统一用它
         self._pools_eff = apply_pool_assignments(pools, pity_groups, self._pool_assignments)
         self.stats = StatsEngine(characters, self._pools_eff, pity_groups, self._shields)
@@ -176,6 +197,65 @@ class MainWindow(QWidget):
         # 视图感知的跨卡池重复过滤器（在 parser.parse 之后、stats.add 之前生效）。
         # 只做跨视图去重，不改 stats 去重算法/历史合并（保底算法冻结）。
         self._pool_tracker = PoolViewTracker()
+        # 卡池识别 P3（2026-10-21）：未知 id 页级防抖 → 主线程截屏 → 后台 OCR
+        # → 页号/行序校验。识别结果只进内存，停止汇总（P4）确认后才写 overlay。
+        # 2026-10-25：0.4.0 旧壳没有 runtime 挂载能力；本次会话强制关闭识别
+        # （不改写 settings，换新壳后恢复用户原选择），并明确提示升级。
+        self._legacy_launcher = host_env.is_legacy_launcher()
+        self._recognition_enabled = load_recognition_enabled()
+        if self._legacy_launcher:
+            logger.warning(
+                "检测到旧启动器（bootstrap api=%s），仅核心功能可用；识别需新版整包",
+                host_env.bootstrap_api(),
+            )
+            if self._recognition_enabled:
+                logger.warning("旧启动器不支持视觉识别组件，本次会话关闭识别（设置未改写）")
+                self._recognition_enabled = False
+        # 服务端版本信息（含各组件模块 runtimes），由 __main__ 启动时注入；
+        # 「更多 → 功能组件…」据此手动检查/下载。
+        self._version_info = None
+        self._recognition_trigger = UnknownRecognitionTrigger()
+        self._recognition_generation = 0  # 新会话递增，丢弃上一会话的迟到结果
+        self._recognition_worker: Optional[RecognitionWorker] = None
+        # 截屏与 OCR 解耦（2026-10-21 P5 实机修正）：OCR 一张约 2s，旧实现要等
+        # 线程空闲才截下一张，用户约 1 秒/页翻页时中间页全被跳过。现在防抖到点
+        # 就立刻截屏入队，OCR 顺序消费；每页截两张（间隔 120ms）兜住游戏 UI
+        # 渲染慢的情况，OCR 先试主图、失败再试兜底图。
+        self._recognition_ocr_queue: deque = deque()  # (task, [Screenshot], generation)
+        # 双图截屏在途状态（2026-10-22 A2）：首图已拿到、兜底图定时器未到。
+        # 存 (task, shots, t0, grab1_ms, generation)；主线程不再 sleep 120ms。
+        self._recognition_grab_pending: Optional[tuple] = None
+        self._recognition_last_task: Optional[RecognitionTask] = None
+        self._recognition_failed_task: Optional[RecognitionTask] = None
+        self._recognition_summary_pending = False  # 停止收尾等 OCR 队列排空的闸
+        self._recognition_banner_kind = ""  # info / error
+        self._recognition_tray: Optional[QSystemTrayIcon] = None  # 失败时的系统通知
+        self._recognition_suggestions: List[object] = []  # 自动配对成功的 PageValidation
+        self._recognition_manual: List[object] = []  # 页号一致但需人工配对的 PageValidation
+        self._recognition_pending: List[object] = []  # 停止时未截屏的 RecognitionTask
+        self._recognition_failures = 0
+        self._recognition_failed_pages: Dict[int, str] = {}  # 停止汇总里列出未识别页
+        # 未知卡池 -> 本会话抓到的角色 id。UP 6★ 往往只出现在未知池的某一页，
+        # 而触发器的 attempted 机制只会 OCR 该池的第一页（2026-10-21 实机：
+        # 30007 第 6 页无 6★、第 7 页才有骑士，导致 UP 没识别到）。这里用
+        # 全部响应（含未 OCR 的页）里的 id + role.json 星级反推 UP。
+        self._recognition_pool_items: Dict[str, set] = {}
+        self._recognition_notice_shown = False
+        self._recognition_status_text = ""  # 状态栏识图提示（_refresh_status 拼接）
+        self._recognition_timer = QTimer(self)
+        # 50ms 轮询：配合 0.15s 防抖，响应后约 0.15~0.2s 就抓屏（毫秒级时延）
+        self._recognition_timer.setInterval(50)
+        self._recognition_timer.timeout.connect(self._poll_recognition)
+        # 成功提示自动收起；收尾等待 OCR 队列的兜底超时（线程异常时不卡住汇总）
+        self._recognition_banner_timer = QTimer(self)
+        self._recognition_banner_timer.setSingleShot(True)
+        self._recognition_banner_timer.timeout.connect(self._hide_recognition_banner)
+        self._recognition_summary_timer = QTimer(self)
+        self._recognition_summary_timer.setSingleShot(True)
+        self._recognition_summary_timer.setInterval(20000)
+        self._recognition_summary_timer.timeout.connect(
+            self._force_recognition_summary
+        )
         self.history = HistoryService(self._active_profile_id)
         self.worker: CaptureWorker | None = None
         # 停止时短等待没等完的旧抓包线程（引擎在无流量时只在下个包才检查停止
@@ -199,6 +279,11 @@ class MainWindow(QWidget):
         # stop 按钮与 worker finished 会先后各调一次收尾，第二次只是把空
         # session_records 再 merge 一遍（纯 no-op 却写盘+备份）→ 跳过。
         self._pending_finalize = False
+        # 练度功能已下线（2026-10-19，结案后产品侧撤下，见 docs/已完成/角色练度获取-终审结论.md）：
+        # 角色练度旁路采集（只读观察帧流，与抽卡主链路互不影响）；
+        # 窗口懒创建（菜单「角色练度」打开，非模态）。
+        # self._roster_capture = RosterCapture(self._active_profile_id, on_updated=self._on_roster_updated)
+        # self._roster_panel: Optional[RosterPanel] = None
         # 会话 Δ（位置平移量）与其基准 total：首个响应到达后由 _ensure_session_shift
         # 计算并下发给 stats（开启实时位置判重）；新会话开始时重置
         self._session_shift: Optional[int] = None
@@ -237,6 +322,7 @@ class MainWindow(QWidget):
         self._more_menu = QMenu(self)
         self._act_export = self._more_menu.addAction("导出 Excel")
         self._act_detail = self._more_menu.addAction("查看明细")
+        # self._act_roster = self._more_menu.addAction("角色练度")  # 练度功能已下线（2026-10-19）
         self._act_restore = self._more_menu.addAction("还原抽卡数据")
         self._act_maintenance = self._more_menu.addAction("抽卡数据维护")
         self._act_maintenance.setVisible(False)  # 暂隐藏「抽卡数据维护」入口
@@ -247,6 +333,22 @@ class MainWindow(QWidget):
         self._act_sync_import = self._more_menu.addAction("导入记录文件…")
         self._more_menu.addSeparator()
         self._act_unknown_menu = self._more_menu.addAction(self._unknown_label())
+        # 卡池识别开关：默认开启（2026-10-21）。只截本机屏幕、不上传；
+        # 关闭后未知 id 仍会在停止时按旧流程提示。
+        self._act_recognition = self._more_menu.addAction("识别未知角色（仅截本机屏幕）")
+        self._act_recognition.setCheckable(True)
+        self._act_recognition.setChecked(self._recognition_enabled)
+        self._act_recognition.toggled.connect(self._on_recognition_toggled)
+        self._act_overlay = self._more_menu.addAction("本机识别结果…")
+        self._act_overlay.triggered.connect(self._open_overlay_manager)
+        # 功能组件（外部 runtime 模块）检查/下载：组件不随 exe 发布，
+        # 缺失时对应功能降级；各模块独立版本、只更新有变化的模块
+        #（启动时也会仅针对已开启功能的组件提示一次）。
+        # 旧启动器不支持 runtime 挂载：入口改为升级整包（下载新版启动器）。
+        self._act_runtime_component = self._more_menu.addAction(
+            "下载新版启动器…" if self._legacy_launcher else "功能组件…"
+        )
+        self._act_runtime_component.triggered.connect(self._open_runtime_component)
         self._more_menu.addSeparator()
         self._act_discovery = self._more_menu.addAction("自助获取抽卡地址")
         # 抓包网卡选择：改用 QActionGroup 互斥子菜单（勾选式）。懒枚举——打开菜单时
@@ -290,6 +392,26 @@ class MainWindow(QWidget):
         )
         main_layout.addWidget(self.capture_note_label)
 
+        # 识图前台反馈条（2026-10-21 P5 实机修正）：识别失败/需要用户停留时，
+        # 状态栏小字会被忽略，必须有醒目的窗口内提示 + 重试入口。
+        # info=发现未知 id / 识别完成，error=识别失败（停留不自动收起）。
+        self.recognition_banner = QFrame()
+        self.recognition_banner.setObjectName("recognitionBanner")
+        banner_layout = QHBoxLayout(self.recognition_banner)
+        banner_layout.setContentsMargins(8, 6, 8, 6)
+        self.recognition_banner_label = QLabel("")
+        self.recognition_banner_label.setObjectName("recognitionBannerText")
+        self.recognition_banner_label.setWordWrap(True)
+        banner_layout.addWidget(self.recognition_banner_label, 1)
+        self.btn_recognition_retry = QPushButton("重新识别当前页")
+        self.btn_recognition_retry.clicked.connect(self._retry_recognition)
+        banner_layout.addWidget(self.btn_recognition_retry)
+        self.btn_recognition_dismiss = QPushButton("关闭提示")
+        self.btn_recognition_dismiss.clicked.connect(self._hide_recognition_banner)
+        banner_layout.addWidget(self.btn_recognition_dismiss)
+        self.recognition_banner.setVisible(False)
+        main_layout.addWidget(self.recognition_banner)
+
         # 主面板：保底/六星命中（每抽明细走「查看明细」弹窗）
         self.pity_panel = PityPanel()
         main_layout.addWidget(self.pity_panel, 1)
@@ -310,6 +432,7 @@ class MainWindow(QWidget):
         self.btn_unknown.clicked.connect(self._show_unknown_id_dialog)
         self._act_export.triggered.connect(self.export_excel)
         self._act_detail.triggered.connect(self._show_detail_dialog)
+        # self._act_roster.triggered.connect(self._open_roster_panel)  # 练度功能已下线（2026-10-19）
         self._act_restore.triggered.connect(self._restore_data)
         self._act_maintenance.triggered.connect(self._open_maintenance)
         self._act_sync_export.triggered.connect(self._export_sync_file)
@@ -330,6 +453,8 @@ class MainWindow(QWidget):
         running = bool(self.worker and self.worker.isRunning())
         self._act_sync_export.setEnabled(not running)
         self._act_sync_import.setEnabled(not running)
+        # 抓包中禁止更新功能组件：安装成功后要立即重启，绝不能打断抓包
+        self._act_runtime_component.setEnabled(not running)
 
     # ---- 账号管理 ----
     def _populate_accounts(self) -> None:
@@ -398,6 +523,7 @@ class MainWindow(QWidget):
         self.stats = StatsEngine(self.characters, self._pools_eff, self.pity_groups, self._shields)
         self.parser = GachaParser()
         self._pool_tracker = PoolViewTracker()
+        # self._rebuild_roster_capture()  # 练度功能已下线（2026-10-19）
         self.session = SessionContext(current_pool_id="all")
         self._current_pool_id = "all"
         self._load_history()
@@ -454,6 +580,7 @@ class MainWindow(QWidget):
         self.stats = StatsEngine(self.characters, self._pools_eff, self.pity_groups, self._shields)
         self.parser = GachaParser()
         self._pool_tracker = PoolViewTracker()
+        # self._rebuild_roster_capture()  # 练度功能已下线（2026-10-19）
         self.session = SessionContext(current_pool_id="all")
         self._current_pool_id = "all"
         self._load_history()
@@ -626,6 +753,24 @@ class MainWindow(QWidget):
         # 新会话：清除上一会话的 Δ 基准（stats 侧已在收尾 begin_new_session 清过；
         # 新 Δ 等首个响应的权威 total 到达后由 _ensure_session_shift 初始化）
         self._shift_base_total = None
+        # 识图会话状态：旧后台线程的结果按 generation 丢弃，不串到新会话
+        self._recognition_generation += 1
+        self._recognition_trigger.reset_session()
+        self._recognition_ocr_queue.clear()
+        self._recognition_grab_pending = None
+        self._recognition_last_task = None
+        self._recognition_failed_task = None
+        self._recognition_summary_pending = False
+        self._recognition_summary_timer.stop()
+        self._hide_recognition_banner()
+        self._recognition_suggestions.clear()
+        self._recognition_manual.clear()
+        self._recognition_pending.clear()
+        self._recognition_failed_pages.clear()
+        self._recognition_pool_items.clear()
+        self._recognition_failures = 0
+        self._recognition_status_text = ""
+        self._recognition_timer.stop()
         logger.info(
             f"start_capture 进入: 地址={self._discovered_addresses} "
             f"worker_running={self.worker.isRunning() if self.worker else False}"
@@ -665,6 +810,18 @@ class MainWindow(QWidget):
         self.status_label.setText("抓包中...")
         self.session.capture_start = datetime.now()
         self._pending_finalize = True  # 本会话待收尾（stop / worker finished 二选一执行）
+        # 首次启用识图时告知一次隐私边界（只截本机屏幕、不上传、不存图）
+        if self._recognition_enabled and not self._recognition_notice_shown:
+            self._recognition_notice_shown = True
+            QMessageBox.information(
+                self,
+                "本机识图",
+                "已开启未知角色识图。\n\n"
+                "出现未知角色/卡池时，工具只截取本机屏幕用于本地 OCR，"
+                "不会上传、不会保存截图，也读不到账号 UID。\n\n"
+                "识别时请把游戏切到「契约记录」页并保持前台；"
+                "可在「更多」菜单随时关闭。",
+            )
         logger.info("开始抓包")
         self._log_slow("start_capture 全流程", _t0)
 
@@ -685,6 +842,13 @@ class MainWindow(QWidget):
 
         # 本次会话一条都没抓到：可能抽卡地址已变更，引导自助发现
         if self.stats.session_new_count == 0:
+            # 走不到 _finalize_capture_session，这里的识图结果/未完成任务仍需收口
+            self._recognition_timer.stop()
+            self._add_recognition_pending(self._recognition_trigger.cancel_pending())
+            try:
+                self._request_recognition_summary()
+            except Exception as e:  # noqa: BLE001 —— 旁路硬约束
+                logger.warning(f"识别结果确认窗失败（不影响收尾）: {e}")
             self._maybe_run_discovery()
             return
 
@@ -877,6 +1041,16 @@ class MainWindow(QWidget):
             # 会话已落库、session_records 已清空，再 merge 是纯 no-op 却写盘
             # +备份（users/ 备份泛滥的根源之一）→ 直接跳过。
             return
+        # 停止后不再自动截屏：未到防抖点的页转「未完成」（P4 停止汇总展示）；
+        # 正在跑的 OCR 线程允许跑完，结果仍归本会话，供停止汇总确认。
+        self._recognition_timer.stop()
+        self._recognition_grab_pending = None  # 在途双图作废（generation 守卫兜底）
+        dropped = self._recognition_trigger.cancel_pending()
+        # 追加而不是覆盖：会话中因翻页过快/积压已被列入未完成的页（2026-10-22
+        # 优先级铁律）同样要出现在停止汇总里，不能被这里冲掉。
+        self._add_recognition_pending(dropped)
+        if dropped:
+            logger.info(f"停止抓包：{len(dropped)} 个待截屏识图页转为未完成")
         try:
             was_empty = self.history.is_empty()  # 会话开始前历史是否为空（重叠自检用）
             # self.stats.finalize()  # 旧账本收尾钩子已注释（位置对齐方案下为空操作，保留接线）
@@ -908,6 +1082,12 @@ class MainWindow(QWidget):
                 "请检查磁盘空间，或杀毒软件/同步盘是否拦截了 data 目录；\n"
                 "关闭程序时会再次尝试保存，请勿直接结束进程。",
             )
+        # 识别结果确认（2026-10-21）：收尾时一次汇总本会话的识别结果。
+        if notify:
+            try:
+                self._request_recognition_summary()
+            except Exception as e:  # noqa: BLE001 —— 旁路硬约束
+                logger.warning(f"识别结果确认窗失败（不影响收尾）: {e}")
 
     def _maybe_run_discovery(self) -> None:
         """本次会话未抓到记录，提示先翻「全部卡池」，再引导自助获取抽卡地址。
@@ -1074,6 +1254,9 @@ class MainWindow(QWidget):
         # 不进磁盘，也顺带避免每帧 hex+I/O 拖慢抓包响应。
         if is_debug_capture_enabled():
             self._debug_dump_frame(frame)
+        # 练度旁路（已下线，2026-10-19）：0x0038 概要 / 000c-0300/0301/0900 等练度帧
+        # 原在这里被只读解析合并落盘（feed 内部逐帧吞异常，绝不影响抽卡主链路）。
+        # self._roster_capture.feed(frame)
         # 被拒（限流）识别必须先于「无记录提前返回」：被拒响应是 8 字节截断帧、
         # 不含任何记录，放在 parser.parse 之后就会永远检测不到（此前正是这种
         # 接法，导致频繁限流丢页时用户无感知）。
@@ -1092,6 +1275,8 @@ class MainWindow(QWidget):
         if not records:
             return
         view = self._pool_tracker.resolve_view(frame)
+        # 卡池识别旁路：未知 id 页级触发（只截本机屏幕、不上传；内部吞异常）
+        self._feed_recognition(frame, records, view)
         kept, dropped = self._pool_tracker.filter_records(view, records)
         if dropped:
             logger.info(f"跨卡池视图过滤 {dropped} 条（当前页面: {self._view_label(view)}）")
@@ -1121,6 +1306,719 @@ class MainWindow(QWidget):
             f"跨视图过滤{dropped} 去重新增{added} 累计{self.stats.total}"
         )
         self._refresh_status()
+
+    # ---- 卡池识别 P3：触发 / 截屏 / 页号校验 ----
+
+    # 前台反馈条配色：info=绿色，error=红色（停留到用户处理）
+    _BANNER_STYLES = {
+        "info": ("#e8f5e9", "#81c784", "#1e6b2e"),
+        "error": ("#fdecea", "#e57373", "#a02020"),
+    }
+
+    def _set_recognition_banner(
+        self, text: str, kind: str = "info", auto_hide: bool = False
+    ) -> None:
+        """在窗口内显示识图提示（不再只写状态栏/日志）。"""
+        bg, border, fg = self._BANNER_STYLES.get(
+            kind, self._BANNER_STYLES["info"]
+        )
+        self._recognition_banner_kind = kind
+        self.recognition_banner.setStyleSheet(
+            "QFrame#recognitionBanner {"
+            f" background:{bg}; border:1px solid {border}; border-radius:4px; }}"
+            "QLabel#recognitionBannerText {"
+            f" color:{fg}; background:transparent; }}"
+        )
+        self.recognition_banner_label.setText(text)
+        self.btn_recognition_retry.setVisible(kind == "error")
+        self.recognition_banner.setVisible(True)
+        self._recognition_banner_timer.stop()
+        if auto_hide:
+            self._recognition_banner_timer.start(6000)
+
+    def _hide_recognition_banner(self) -> None:
+        self._recognition_banner_timer.stop()
+        self._recognition_banner_kind = ""
+        self.recognition_banner.setVisible(False)
+
+    def _notify_recognition_failure(self, message: str) -> None:
+        """系统托盘通知：游戏在前台/工具被遮住时也能看到识别失败。
+
+        窗口内提示条只在工具可见时有效；任务栏闪烁对全屏游戏也不一定显眼，
+        因此失败额外走一条托盘气泡（Windows 会在右下角弹出）。
+        """
+        try:
+            if self._recognition_tray is None:
+                icon = app_icon()
+                if icon.isNull():
+                    return
+                self._recognition_tray = QSystemTrayIcon(icon, self)
+                self._recognition_tray.setToolTip("金鳞抽卡导出工具")
+                self._recognition_tray.show()
+            self._recognition_tray.showMessage(
+                "卡池识别需要你处理",
+                message,
+                QSystemTrayIcon.MessageIcon.Warning,
+                9000,
+            )
+        except Exception:  # noqa: BLE001 —— 通知失败不影响识别/抓包
+            pass
+
+    def _retry_recognition(self) -> None:
+        """D14「手动重新识别」：对最近一次失败任务立即重新截屏 + OCR。
+
+        典型场景：防抖窗口内用户已翻到下一页导致页号不符。用户翻回目标页
+        后点此按钮即可补识别，不必重新开始抓包。
+        """
+        task = self._recognition_failed_task or self._recognition_last_task
+        if task is None:
+            self._set_recognition_banner(
+                "没有可重试的识别任务：请先翻到含未知角色的页面触发一次，"
+                "或重新开始抓包。",
+                "error",
+            )
+            return
+        if not self._recognition_enabled or not features.available("recognition"):
+            self._set_recognition_banner(
+                "识图未开启或视觉识别组件不可用，无法重试。", "error"
+            )
+            return
+        try:
+            shots = self._grab_recognition_shots()
+        except ScreenGrabError as e:
+            self._recognition_failed_message(str(e), task)
+            return
+        except Exception as e:  # noqa: BLE001
+            self._recognition_failed_message(f"截屏异常：{e}", task)
+            return
+        self._recognition_trigger.retry(task)  # 同一页收到新响应也可再次触发
+        self._recognition_last_task = task
+        self._enqueue_recognition(task, shots)
+        self._set_recognition_banner(
+            f"正在重新识别第 {task.page} 页…（请保持游戏画面停在该页）", "info"
+        )
+
+    def _on_recognition_toggled(self, checked: bool) -> None:
+        """菜单开关：持久化并立即生效（关闭时丢弃未截屏任务）。
+
+        开启前检查功能组件：组件缺失时不置位（否则会显示「已开启」但
+        实际不识别），并引导到「更多 → 功能组件…」；旧启动器则明确
+        提示需下载新版整包，不引导下载无效的 runtime。
+        """
+        if checked and self._legacy_launcher:
+            self._act_recognition.blockSignals(True)
+            self._act_recognition.setChecked(False)
+            self._act_recognition.blockSignals(False)
+            self._recognition_enabled = False  # 本次会话保持关闭，不改写设置
+            self.status_label.setText("旧启动器不支持识别，需下载 1.0.0 新版整包")
+            self._offer_launcher_upgrade()
+            return
+        if checked and not features.available("recognition"):
+            self._act_recognition.blockSignals(True)
+            self._act_recognition.setChecked(False)
+            self._act_recognition.blockSignals(False)
+            self._recognition_enabled = False
+            save_recognition_enabled(False)
+            self.status_label.setText("视觉识别组件未安装，识别未开启")
+            QMessageBox.information(
+                self, "功能组件未就绪",
+                features.unavailable_reason("recognition")
+                + "\n\n可从「更多 → 功能组件…」下载，安装完成后工具会自动重启。",
+            )
+            return
+        self._recognition_enabled = bool(checked)
+        save_recognition_enabled(self._recognition_enabled)
+        if not self._recognition_enabled:
+            self._recognition_timer.stop()
+            self._recognition_ocr_queue.clear()
+            self._recognition_grab_pending = None
+            self._hide_recognition_banner()
+            dropped = self._recognition_trigger.cancel_pending()
+            if dropped:
+                logger.info(f"识图已关闭，丢弃 {len(dropped)} 个待截屏页")
+            self.status_label.setText("已关闭未知角色识图（未知 id 仍会在停止时提示）")
+
+    def _feed_recognition(
+        self, frame: bytes, records: List[GachaRecord], view: Optional[str]
+    ) -> None:
+        """旁路：把本页未知 id 交给防抖触发器。任何异常都不得影响抓包主链路。"""
+        if not self._recognition_enabled:
+            return
+        if not features.available("recognition"):
+            return  # 组件缺失：不排队、不截屏（核心抓包不受影响）
+        try:
+            ctx = self._pool_tracker.latest_response_context(frame)
+            if ctx is None:
+                return
+            ctx_view, offset, total = ctx
+            if view is not None and ctx_view != view:
+                logger.info(f"识图视图不一致（响应 {ctx_view} / 解析 {view}），以响应为准")
+            if ctx_view is None or not is_all_pools(ctx_view):
+                return
+            # 未知池出现过的角色 id 全量记账（不依赖该页是否 OCR），供 UP 推断
+            known_pools = set(self._pools_eff)
+            for rec in records:
+                pid = rec.pool_id
+                if pid and pid not in known_pools:
+                    self._recognition_pool_items.setdefault(pid, set()).add(
+                        rec.item_id
+                    )
+            if self._recognition_trigger.feed(
+                records,
+                ctx_view,
+                offset,
+                total,
+                set(self.characters),
+                set(self._pools_eff),
+            ):
+                if not self._recognition_timer.isActive():
+                    self._recognition_timer.start()
+                # 前台先告诉用户「这一页有未知 id、请停一下」——实机反馈里
+                # 用户不知道自己该停在哪页，状态栏小字也没看见。
+                pending = self._recognition_trigger.latest_pending()
+                if pending is not None:
+                    bits = []
+                    if pending.unknown_item_ids:
+                        bits.append(f"{len(pending.unknown_item_ids)} 个未知角色")
+                    if pending.unknown_pool_ids:
+                        bits.append(f"{len(pending.unknown_pool_ids)} 个未知卡池")
+                    self._set_recognition_banner(
+                        f"第 {pending.page}/{pending.total_page} 页发现"
+                        + "、".join(bits)
+                        + "，请停在此页约 1 秒完成截屏识别…",
+                        "info",
+                    )
+        except Exception as e:  # noqa: BLE001 —— 旁路硬约束
+            logger.warning(f"未知 id 识别触发异常（不影响抓包）: {e}")
+
+    def _poll_recognition(self) -> None:
+        """防抖到点：主线程只抓首图（不编码），120ms 后补兜底图。
+
+        2026-10-22 优先级铁律（性能第一）：
+        - **A1**：截屏永不因 OCR 积压停摆——队列再深也照常截屏；内存上限只作
+          病态流量兜底，超限丢最旧页并放行其 id（翻回可重新触发）。
+        - **A2**：主线程不再 ``sleep(0.12)`` 等兜底图；首图拿到即让出事件循环，
+          兜底图由 ``QTimer.singleShot`` 补拍，PNG/像素转换全部留给 OCR 线程。
+        - **F4**：每页落一行响应→截图计时，供实机核对截图延迟。
+        """
+        if not self._recognition_enabled:
+            self._recognition_timer.stop()
+            return
+        if not features.available("recognition"):
+            # 组件在运行中被删/安装后未重启：停止轮询，避免每 250ms 空转
+            self._recognition_timer.stop()
+            self._recognition_enabled = False
+            save_recognition_enabled(False)
+            self.status_label.setText("视觉识别组件不可用，识别已暂停（重启或下载组件后重开）")
+            logger.warning(
+                "功能组件不可用，已暂停未知角色识别: "
+                f"{features.unavailable_reason('recognition')}"
+            )
+            return
+        # A2：上一页双图在途（≤120ms）时先不触发，避免两次截屏交错
+        if self._recognition_grab_pending is not None:
+            return
+        task = self._recognition_trigger.poll()
+        for dropped in self._recognition_trigger.take_abandoned():
+            # 防抖窗口内被翻走、从未截屏的页：列入未完成，不标 attempted
+            self._add_recognition_pending([dropped])
+            logger.info(
+                f"识图跳过第 {dropped.page}/{dropped.total_page} 页（翻页过快），"
+                "已列入未完成，翻回可重新触发"
+            )
+        if task is None:
+            if self._recognition_trigger.pending_count == 0:
+                self._recognition_timer.stop()
+            return
+        t0 = time.monotonic()
+        try:
+            shot = grab_game_screen(encode_png=False)
+        except ScreenGrabError as e:
+            self._recognition_grab_failed(task, str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            self._recognition_grab_failed(task, f"截屏异常：{e}")
+            return
+        grab1_ms = (time.monotonic() - t0) * 1000
+        self._recognition_last_task = task
+        self._recognition_grab_pending = (
+            task, [shot], t0, grab1_ms, self._recognition_generation
+        )
+        QTimer.singleShot(120, self._complete_recognition_grab)
+
+    # A1：队列上限按页计（每页 2 张 QImage ≈ 15MB），16 页约 250MB 封顶。
+    # 正常会话未知页是个位数（每个未知 id 只触发一次），此上限只兜病态流量。
+    MAX_OCR_QUEUE_PAGES = 16
+
+    def _add_recognition_pending(self, tasks) -> None:
+        """列入「未完成」页；同页同未知 id 只记一次（重复计入会让汇总数量虚高）。"""
+        seen = {
+            (t.page, tuple(t.unknown_item_ids), tuple(t.unknown_pool_ids))
+            for t in self._recognition_pending
+        }
+        for task in tasks:
+            key = (task.page, tuple(task.unknown_item_ids), tuple(task.unknown_pool_ids))
+            if key in seen:
+                continue
+            seen.add(key)
+            self._recognition_pending.append(task)
+
+    def _clear_recognition_pending_page(self, page: int) -> None:
+        """该页已实际截屏并出 OCR 结果，移出「未完成」名单（失败另记 failed_pages）。"""
+        if self._recognition_pending:
+            self._recognition_pending[:] = [
+                t for t in self._recognition_pending if t.page != page
+            ]
+
+    def _complete_recognition_grab(self) -> None:
+        """兜底图到点：补拍第二张 → 入队 → 启动后台 OCR（主线程不 sleep）。"""
+        pending = self._recognition_grab_pending
+        self._recognition_grab_pending = None
+        if pending is None:
+            return
+        task, shots, t0, grab1_ms, gen = pending
+        if gen != self._recognition_generation or not self._recognition_enabled:
+            return  # 会话已停止/切换：作废在途截图
+        grab2_ms = 0.0
+        try:
+            t1 = time.monotonic()
+            shots.append(grab_game_screen(encode_png=False))
+            grab2_ms = (time.monotonic() - t1) * 1000
+        except Exception as e:  # noqa: BLE001 —— 兜底图失败不影响主图
+            logger.info(f"兜底截图失败（仅用主图）: {e}")
+        response_ms = (t0 - task.created_at) * 1000
+        total_ms = response_ms + (time.monotonic() - t0) * 1000
+        logger.info(
+            f"识图计时 page={task.page}/{task.total_page} "
+            f"响应→轮询={response_ms:.0f}ms 首图={grab1_ms:.0f}ms "
+            f"兜底={grab2_ms:.0f}ms 响应→双图完成={total_ms:.0f}ms"
+        )
+        logger.info(
+            f"识图任务 page={task.page}/{task.total_page} "
+            f"未知角色={list(task.unknown_item_ids)} 未知池={list(task.unknown_pool_ids)} "
+            f"截图={len(shots)} 张"
+        )
+        self._enqueue_recognition(task, shots)
+
+    def _enqueue_recognition(self, task, shots) -> None:
+        """入队；超内存上限时丢最旧页并放行其 id（A1：绝不静默丢、可翻回重触发）。"""
+        dropped_pages = 0
+        while len(self._recognition_ocr_queue) >= self.MAX_OCR_QUEUE_PAGES:
+            old_task, _old_shots, _old_gen = self._recognition_ocr_queue.popleft()
+            # poll() 时已标 attempted：必须放行，用户翻回该页才能再次触发
+            self._recognition_trigger.retry(old_task)
+            self._add_recognition_pending([old_task])
+            dropped_pages += 1
+            logger.warning(
+                f"识图积压超过 {self.MAX_OCR_QUEUE_PAGES} 页，释放最早的第 "
+                f"{old_task.page}/{old_task.total_page} 页（翻回可重新识别）"
+            )
+        if dropped_pages:
+            self._set_recognition_banner(
+                f"本机识别积压，已释放 {dropped_pages} 个较早的页；"
+                "翻回对应页会自动重新识别。",
+                "info",
+            )
+        self._recognition_ocr_queue.append(
+            (task, shots, self._recognition_generation)
+        )
+        self._start_next_recognition_worker()
+
+    def _grab_recognition_shots(self) -> List[object]:
+        """手动重试（D14）用：同步抓两张（用户主动点击，120ms 等待可接受）。
+
+        自动触发路径不用本函数（A2：异步兜底图，主线程不 sleep）。
+        """
+        shots = [grab_game_screen(encode_png=False)]
+        try:
+            time.sleep(0.12)
+            shots.append(grab_game_screen(encode_png=False))
+        except Exception as e:  # noqa: BLE001 —— 兜底图失败不影响主图
+            logger.info(f"兜底截图失败（仅用主图）: {e}")
+        return shots
+
+    def _start_next_recognition_worker(self) -> None:
+        """从队列取一张开始 OCR；同一时刻只有一个 OCR 线程。"""
+        if self._recognition_worker is not None or not self._recognition_ocr_queue:
+            return
+        task, shots, gen = self._recognition_ocr_queue.popleft()
+        worker = RecognitionWorker(
+            task, shots, self.characters, set(self._pools_eff), parent=self
+        )
+        self._recognition_worker = worker
+        worker.done.connect(lambda v, g=gen: self._on_recognition_done(v, g))
+        worker.failed.connect(
+            lambda msg, t=task, g=gen: self._on_recognition_failed(t, msg, g)
+        )
+        worker.finished.connect(lambda w=worker: self._on_recognition_worker_finished(w))
+        # A3：OCR 线程低优先级，让主线程（截屏/GUI/抓包）永远先拿到 CPU
+        worker.start(QThread.Priority.LowPriority)
+        self._recognition_status_text = f"正在识别第 {task.page} 页（本机截屏，不上传）"
+        self._refresh_status()
+
+    def _on_recognition_done(self, validation, generation: int) -> None:
+        """OCR 结果回主线程：通过则暂存建议，失败则前台提示并允许重试。"""
+        if generation != self._recognition_generation:
+            logger.info("丢弃上一会话的识图结果")
+            return
+        task = validation.task
+        # 该页已实际截屏并出结果：无论成败都不再算「未截屏未完成」
+        # （失败另有 failed_pages 记录与重试入口）
+        self._clear_recognition_pending_page(task.page)
+        if validation.ok:
+            self._recognition_failures = 0
+            self._recognition_failed_pages.pop(task.page, None)
+            if validation.unknown_item_bindings or validation.unknown_pool_names:
+                self._recognition_suggestions.append(validation)
+            self._recognition_trigger.finish(task, "recognized")
+            if (
+                self._recognition_failed_task is not None
+                and self._recognition_failed_task.key == task.key
+            ):
+                self._recognition_failed_task = None
+            n = len(validation.unknown_item_bindings) + len(validation.unknown_pool_names)
+            self._recognition_status_text = (
+                f"第 {task.page} 页识别完成，{n} 项待停止后确认（共 "
+                f"{len(self._recognition_suggestions)} 页）"
+            )
+            self._set_recognition_banner(
+                f"✓ 第 {task.page}/{task.total_page} 页识别完成："
+                f"{n} 项待停止后确认。",
+                "info",
+                auto_hide=True,
+            )
+            logger.info(
+                f"识图通过 page={task.page} order={validation.order} "
+                f"ratio={validation.ratio:.2f} 未知角色={len(validation.unknown_item_bindings)} "
+                f"未知池={len(validation.unknown_pool_names)}"
+            )
+            # 停止后点「重新识别当前页」成功：等队列排空补弹汇总，否则这页
+            # 建议会一直留在内存里用户看不到。
+            if (
+                not (self.worker and self.worker.isRunning())
+                and not self._recognition_summary_pending
+            ):
+                self._request_recognition_summary()
+        else:
+            self._recognition_trigger.finish(task, "failed")
+            # 失败后放行该页 id：用户翻回去收到新响应时能再次触发，不必重启抓包
+            self._recognition_trigger.retry(task)
+            # 页号一致、只是行序/名字校验没过的页允许人工配对（角色或卡池皆可）；
+            # 页号不一致时截图行属于别的页，绝不提供绑定入口。
+            page = validation.page
+            if (
+                page is not None
+                and page.rows
+                and page.page == task.page
+                and page.total_page == task.total_page
+                and (task.unknown_item_ids or task.unknown_pool_ids)
+            ):
+                self._recognition_manual.append(validation)
+            self._recognition_failed_message(str(validation.reason), task)
+        self._refresh_status()
+
+    def _on_recognition_failed(
+        self, task, message: str, generation: int
+    ) -> None:
+        """OCR 线程失败（缺依赖/解码等）→ 与校验失败同样前台提示 + 可重试。"""
+        if generation != self._recognition_generation:
+            return
+        self._clear_recognition_pending_page(task.page)
+        self._recognition_trigger.finish(task, "failed")
+        self._recognition_trigger.retry(task)
+        self._recognition_failed_message(message, task)
+        self._refresh_status()
+
+    def _recognition_grab_failed(self, task, message: str) -> None:
+        """截屏失败：本张不识别；放行该页，连续两次则暂停自动轮询。"""
+        self._recognition_trigger.finish(task, "failed")
+        self._recognition_trigger.retry(task)
+        self._recognition_failed_message(message, task)
+        self._refresh_status()
+
+    def _recognition_failed_message(
+        self, message: str, task: Optional[RecognitionTask] = None
+    ) -> None:
+        """识图失败：窗口内红色提示条 + 任务栏闪烁 + 重试入口（不再只写状态栏）。"""
+        self._recognition_failures += 1
+        logger.warning(f"识图失败（连续 {self._recognition_failures} 次）: {message}")
+        if task is not None:
+            self._recognition_last_task = task
+            self._recognition_failed_task = task
+            self._recognition_failed_pages[task.page] = message
+            text = (
+                f"第 {task.page}/{task.total_page} 页识别未完成：{message}\n"
+                f"请翻回第 {task.page} 页停稳后点「重新识别当前页」；"
+                f"继续翻回该页也会自动重新触发。"
+            )
+        else:
+            text = f"识别未完成：{message}"
+        self._set_recognition_banner(text, "error")
+        # 用户抓包时通常不看工具：只在连续失败的第一条弹托盘，避免刷屏；
+        # 真正需要处理的信息统一放到「停止抓包」后的汇总窗里。
+        if self._recognition_failures <= 1:
+            self._notify_recognition_failure(text)
+        try:
+            QApplication.alert(self, 0)
+        except Exception:  # noqa: BLE001 —— 平台差异，提示条已足够
+            pass
+        if self._recognition_failures >= 2:
+            self._recognition_timer.stop()
+            self._recognition_status_text = "识图失败，可点「重新识别当前页」重试"
+        else:
+            self._recognition_status_text = f"识图失败：{message}"
+
+    def _on_recognition_worker_finished(self, worker=None) -> None:
+        # 线程由主窗口持有父对象；释放后再置空，避免每次识图累积 QThread
+        if worker is not None:
+            worker.deleteLater()
+        self._recognition_worker = None
+        self._start_next_recognition_worker()
+        if self._recognition_worker is None:
+            # 队列排空 → 若停止收尾在等，就把汇总弹出来
+            self._maybe_show_recognition_summary()
+
+    # ---- 识别汇总的延迟闸（停止时等 OCR 队列排空再弹确认窗） ----
+
+    def _request_recognition_summary(self) -> None:
+        self._recognition_summary_pending = True
+        self._maybe_show_recognition_summary()
+
+    def _maybe_show_recognition_summary(self) -> None:
+        if not self._recognition_summary_pending:
+            return
+        waiting = len(self._recognition_ocr_queue) + (
+            1 if self._recognition_worker is not None else 0
+        )
+        if waiting:
+            self._recognition_status_text = f"正在完成本机识别（剩余 {waiting} 张）…"
+            self._refresh_status()
+            if not self._recognition_summary_timer.isActive():
+                self._recognition_summary_timer.start()
+            return
+        self._recognition_summary_timer.stop()
+        self._recognition_summary_pending = False
+        self._show_recognition_summary()
+
+    def _force_recognition_summary(self) -> None:
+        """OCR 卡死/超时兜底：不再等待，直接弹当前汇总。"""
+        logger.warning("等待识图队列超时，直接弹出识别汇总")
+        self._recognition_summary_pending = False
+        self._show_recognition_summary()
+
+    def _show_recognition_summary(self) -> None:
+        """停止抓包后弹出识别结果确认；取消则不写 overlay。"""
+        if not (
+            self._recognition_suggestions
+            or self._recognition_manual
+            or self._recognition_pending
+            or self._recognition_failed_pages
+        ):
+            return
+        dlg = RecognitionDialog(
+            self,
+            self._recognition_suggestions,
+            self._recognition_manual,
+            self._recognition_pending,
+            self.characters,
+            self.pools,
+            failed_pages=dict(self._recognition_failed_pages),
+            pool_items=self._recognition_pool_items,
+        )
+        accepted = dlg.exec() == QDialog.Accepted
+        if accepted and (dlg.written_characters or dlg.written_pools):
+            self._apply_recognition_writes(dlg.written_characters, dlg.written_pools)
+        else:
+            logger.info("识别结果未写入 overlay（取消或没有勾选项）")
+        # 本会话结果已处理完
+        self._recognition_suggestions.clear()
+        self._recognition_manual.clear()
+        self._recognition_pending.clear()
+        self._recognition_failed_pages.clear()
+        self._recognition_pool_items.clear()
+        self._recognition_status_text = ""
+        self.refresh_ui()
+
+    def _apply_recognition_writes(
+        self, characters: Dict[str, dict], pools: Dict[str, dict]
+    ) -> None:
+        """把确认窗结果注入内存（stats 持同一引用，立即生效）。"""
+        for iid, entry in characters.items():
+            self.characters[iid] = Character(
+                id=iid,
+                name=str(entry.get("name") or "").strip(),
+                rarity=int(entry.get("rarity") or 6),
+                limited=bool(entry.get("limited")),
+            )
+        if pools:
+            for pid, entry in pools.items():
+                self.pools[pid] = Pool(
+                    id=pid,
+                    name=str(entry.get("name") or "").strip(),
+                    type=str(entry.get("type") or "未知"),
+                    order=int(entry.get("order") or 0),
+                    rarity=int(entry.get("rarity") or 0),
+                    up_character=str(entry.get("up_character") or ""),
+                    pity_group=str(entry.get("pity_group") or ""),
+                )
+            self._rebuild_effective_pools()
+        logger.info(
+            f"识别结果已生效：角色 {len(characters)}、卡池 {len(pools)}"
+        )
+
+    def _rebuild_effective_pools(self) -> None:
+        """原地刷新生效池映射（stats 持有同一 dict 引用，不能换对象）。"""
+        effective = apply_pool_assignments(
+            self.pools, self.pity_groups, self._pool_assignments
+        )
+        self._pools_eff.clear()
+        self._pools_eff.update(effective)
+
+    def set_version_info(self, info) -> None:
+        """注入启动时拉到的服务端版本信息（含各组件模块 runtimes）。"""
+        self._version_info = info
+
+    def show_runtime_hint(self) -> None:
+        """启动提示：已开启功能所需组件不可用时只落状态栏（不弹窗）。"""
+        if self._legacy_launcher:
+            self.status_label.setText(
+                "当前为旧启动器：仅核心抓包/导出可用；"
+                "识别需下载 1.0.0 新版整包（更多 → 下载新版启动器…）"
+            )
+            return
+        missing = []
+        for name, feature in features.FEATURES.items():
+            if feature.requires_modules and features.enabled(name) \
+                    and not features.available(name):
+                missing.append(feature.label)
+        if missing:
+            self.status_label.setText(
+                "、".join(missing)
+                + " 所需组件未就绪（更多 → 功能组件…）"
+            )
+
+    def _offer_launcher_upgrade(self) -> None:
+        """旧启动器升级引导：只打开官网下载页，不触碰 runtime 下载链路。"""
+        box = QMessageBox(self)
+        box.setWindowTitle("需要新版启动器")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("当前启动器（0.4.0 旧壳）不支持视觉识别组件。")
+        box.setInformativeText(
+            "核心抓包、统计、导出不受影响。识别功能需下载 1.0.0 新版整包，"
+            "历史数据会自动沿用。"
+        )
+        btn_download = box.addButton("打开下载页", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is btn_download:
+            webbrowser.open(host_env.LAUNCHER_DOWNLOAD_URL)
+
+    def _open_runtime_component(self) -> None:
+        """「功能组件…」：手动检查/下载外部 runtime 模块。"""
+        if self._legacy_launcher:
+            self._offer_launcher_upgrade()
+            return
+        if self.worker and self.worker.isRunning():
+            # 安装成功后立即重启，抓包中更新会直接打断本次抓取
+            QMessageBox.information(
+                self, "请先停止抓包",
+                "抓包进行中不能更新功能组件。请先停止抓包，再打开「功能组件…」。",
+            )
+            return
+        info = self._version_info
+        if info is None:
+            QMessageBox.information(
+                self, "功能组件",
+                "尚未获取到组件信息（可能未联网）。请稍后重试，或检查网络后重启工具。",
+            )
+            return
+        dialog = RuntimeUpdateDialog(info, manual=True, parent=self)
+        dialog.exec()
+        if dialog.disabled_features:
+            self.apply_disabled_features(dialog.disabled_features)
+        if dialog.restart_requested:
+            self.restart_for_runtime_update()
+        elif dialog.installed:
+            # 仅部分模块成功（或重启拉起失败）：新组件需下次启动才挂载
+            self.status_label.setText("功能组件已安装/更新，重启工具后生效")
+
+    def apply_disabled_features(self, names) -> None:
+        """用户为跳过组件更新而停用功能：持久化已由对话框完成，这里同步 UI。
+
+        目前只有卡池识别有菜单状态需要回写；后续功能接入时在此扩展。
+        """
+        disabled = set(names or [])
+        if not disabled:
+            return
+        logger.info(f"因跳过组件更新而停用功能: {', '.join(sorted(disabled))}")
+        if "recognition" in disabled:
+            self._recognition_enabled = False
+            self._act_recognition.blockSignals(True)
+            self._act_recognition.setChecked(False)
+            self._act_recognition.blockSignals(False)
+            self._recognition_timer.stop()
+            self._recognition_ocr_queue.clear()
+            self._recognition_grab_pending = None
+            self._hide_recognition_banner()
+            self._recognition_trigger.cancel_pending()
+            self.status_label.setText(
+                "已停用卡池识别以跳过组件更新；可随时在「更多」中重新开启"
+            )
+
+    def restart_for_runtime_update(self) -> None:
+        """组件安装成功后立即重启：先拉起新进程，再正常关窗退出。
+
+        新进程带旧 PID 并等待其退出（见 utils/restart.py），不会双开。
+        """
+        if getattr(self, "_restarting", False):
+            return
+        if not host_env.supports_auto_restart():
+            # API=2 的 1.0.0 首批测试壳不认识 --restart-after：直接拉起会双开，
+            # 因此只提示手动重启（当前进程仍可继续使用旧组件）。
+            QMessageBox.information(
+                self, "组件已安装",
+                "组件已安装，请手动关闭并重新打开工具以启用新组件。\n"
+                "（当前启动器版本不支持自动重启。）",
+            )
+            self.status_label.setText("组件已安装，请手动重启工具")
+            return
+        from ..utils import restart as restart_util
+
+        # 启动阶段的强制更新理论上可能赶上刚点的「开始抓包」：先安全停包
+        # （合并历史由 closeEvent 负责），不能带着抓包线程退出。
+        if self.worker and self.worker.isRunning():
+            self._stop_worker(wait_ms=2000)
+        if not restart_util.spawn_restart():
+            QMessageBox.warning(
+                self, "自动重启失败",
+                "组件已安装，但自动重启失败。请手动关闭并重新打开工具以启用新组件。",
+            )
+            self.status_label.setText("组件已安装，请手动重启工具")
+            return
+        self._restarting = True
+        self.status_label.setText("组件已安装，正在重启工具…")
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _open_overlay_manager(self) -> None:
+        """「本机识别结果」：查看/删除 overlay（删除即回到识别前统计口径）。"""
+        dlg = OverlayManagerDialog(self)
+        dlg.exec()
+        if not dlg.removed:
+            return
+        for kind, oid in dlg.removed:
+            if kind == "character":
+                # 远端 role.json 里已有的同一 id 不因删 overlay 而消失
+                if oid not in self._base_character_ids:
+                    self.characters.pop(oid, None)
+            else:
+                if oid not in self._base_pool_ids:
+                    self.pools.pop(oid, None)
+                    self._pools_eff.pop(oid, None)
+        self._rebuild_effective_pools()
+        self.refresh_ui()
 
     def on_request(self, frame: bytes) -> None:
         """收到完整帧（客户端->服务器，切池/翻页请求）。
@@ -1199,6 +2097,8 @@ class MainWindow(QWidget):
                     parts.append(
                         f"⚠ {self._view_label(view)} {n_pool}/{pool_total}，本池还有缺口"
                     )
+        if self._recognition_status_text:
+            parts.append(self._recognition_status_text)
         self.status_label.setText("  ".join(parts))
 
     def _debug_dump_frame(self, frame: bytes) -> None:
@@ -1261,6 +2161,41 @@ class MainWindow(QWidget):
         self.btn_unknown.setVisible(n_unknown > 0)
         self._act_unknown_menu.setText(self._unknown_label())
         self._log_slow("refresh_ui(面板重建)", _t0)
+
+    # ---- 练度功能已下线（2026-10-19，课题终审结案后产品侧撤下；恢复时连同
+    # 顶部 import 与构造/菜单/账号切换/feed 各处一起解开）。----
+
+    # def _rebuild_roster_capture(self) -> None:
+    #     """练度采集器按当前账号重建（练度文件按账号隔离），并关掉旧窗口。"""
+    #     if self._roster_panel is not None:
+    #         self._roster_panel.close()
+    #         self._roster_panel.deleteLater()
+    #         self._roster_panel = None
+    #     self._roster_capture = RosterCapture(
+    #         self._active_profile_id, on_updated=self._on_roster_updated
+    #     )
+    #
+    # def _open_roster_panel(self) -> None:
+    #     """「角色练度」：非模态独立窗口（show() 而非 exec()，可与主窗口并行）。"""
+    #     if self._roster_panel is not None:
+    #         self._roster_panel.refresh()  # 打开期间可能又有新帧进来
+    #         self._roster_panel.show()
+    #         self._roster_panel.raise_()
+    #         self._roster_panel.activateWindow()
+    #         return
+    #     prof = self.profiles.get(self._active_profile_id)
+    #     self._roster_panel = RosterPanel(
+    #         self,
+    #         profile_id=self._active_profile_id,
+    #         profile_name=prof.name if prof else "",
+    #         characters=self.characters,
+    #     )
+    #     self._roster_panel.show()
+    #
+    # def _on_roster_updated(self) -> None:
+    #     """练度数据有变化：面板开着就刷新（feed 已在主线程，无需跨线程）。"""
+    #     if self._roster_panel is not None and self._roster_panel.isVisible():
+    #         self._roster_panel.refresh()
 
     def _open_maintenance(self) -> None:
         """「抽卡数据维护」：手动补齐缺失历史。仅展示层生效、不改真实记录。"""

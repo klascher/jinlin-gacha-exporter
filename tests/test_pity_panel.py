@@ -175,15 +175,16 @@ def test_same_tenpull_two_six_newest_on_top():
 
 
 def test_featured_tag_present_and_colored():
-    """featured 池命中行带 [UP·必出]/[歪] 标记并着色（绿/红）。
+    """featured 池命中行带 [UP]/[歪] 标记并着色（绿/红）。
 
-    30002 的命中前置是 30001 的歪（共享组跨池继承大保底）→ 必出，标 [UP·必出]。
+    30002 的命中前置是 30001 的歪（共享组跨池继承大保底）→ 必出；2026-10-10
+    去必出标注后与 50/50 胜同样只标 [UP]。
     """
     panel, _ = _build_panel()
     rows = {r.pool_id: r for r in _pool_rows(_sections(panel)[0])}
     up_hit = _hit_rows(rows["30002"])[0]
     assert up_hit.tag_label is not None
-    assert up_hit.tag_label.text() == "[UP·必出]"
+    assert up_hit.tag_label.text() == "[UP]"
     assert "#2e8b57" in up_hit.tag_label.styleSheet()  # 绿
     miss_hit = _hit_rows(rows["30001"])[0]
     assert miss_hit.tag_label.text() == "[歪]"
@@ -389,8 +390,8 @@ def test_view_toggle_default_and_switch_to_flow():
     assert all(r.pool_name for r in rows)
 
 
-def test_flow_view_tag_order_and_guaranteed():
-    """流水行标签在最前：必出 UP=[UP·必出]、50/50 胜=[UP]、歪=[歪]；常驻无标签。
+def test_flow_view_tag_order():
+    """流水行标签在最前：UP（含必出）=[UP]、歪=[歪]；常驻无标签（2026-10-10 去必出）。
 
     时间序：2000 池1歪 -> 3000 池2命中（前置歪在 30001，大保底必出）
     -> 5000/6000 池4命中（50/50 胜）。展示倒序。
@@ -400,7 +401,7 @@ def test_flow_view_tag_order_and_guaranteed():
     rows = _flow_rows(_sections(panel)[0])
     assert rows[0].tag_label.text() == "[UP]"
     assert rows[1].tag_label.text() == "[UP]"
-    assert rows[2].tag_label.text() == "[UP·必出]"
+    assert rows[2].tag_label.text() == "[UP]"
     assert "#2e8b57" in rows[2].tag_label.styleSheet()
     assert rows[3].tag_label.text() == "[歪]"
     assert "#c0392b" in rows[3].tag_label.styleSheet()
@@ -498,7 +499,7 @@ def test_flow_view_columns_fixed_width():
                 widgets.append(w)
         tag, pity_lbl, name_lbl, pool_lbl = widgets[0], widgets[1], widgets[2], widgets[3]
         # setFixedWidth = min/max 同值；与 _col_w 样文本计算一致
-        assert tag.minimumWidth() == tag.maximumWidth() == _col_w("[UP·必出]")
+        assert tag.minimumWidth() == tag.maximumWidth() == _col_w("[UP]")
         assert pity_lbl.minimumWidth() == _col_w("第00抽")
         assert name_lbl.minimumWidth() == _col_w("字" * 15)
         assert pool_lbl.minimumWidth() == _col_w("字" * 10)

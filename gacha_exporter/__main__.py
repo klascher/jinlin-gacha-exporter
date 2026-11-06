@@ -8,6 +8,7 @@ from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QProgressDialog
 
 from . import __version__
+from . import features
 from .loaders.remote_data import (
     check_health,
     load_announcements,
@@ -18,11 +19,13 @@ from .loaders.remote_data import (
 from .gui.announcement_dialog import AnnouncementDialog
 from .gui.main_window import MainWindow
 from .gui.npcap_dialog import NPCAP_DOWNLOAD_URL, NpcapDependencyDialog, find_bundled_npcap_installer
+from .gui.runtime_dialog import RuntimeUpdateDialog, pending_modules
 from .gui.theme import apply_light_theme
 from .gui.update_dialog import UpdateDialog
 from .models import DataNotReadyError
-from .storage.announcements import load_read_ids
+from .storage.announcements import cleanup_read_ids, load_read_ids
 from .storage.coord_migration import migrate_coord_frame
+from .storage.pool_assignments import cleanup_pool_assignments
 from .storage.profiles import ProfileManager
 from .storage.settings import (
     clear_rejected_forced_version,
@@ -33,6 +36,8 @@ from .storage.settings import (
 from .utils.helpers import check_npcap_installed
 from .utils.logger import get_logger, setup_logging
 from .utils.paths import get_data_dir, get_logs_dir, migrate_legacy_flat_files
+from .utils import runtime_pack
+from .utils import host_env
 from .utils.version import is_newer
 
 logger = get_logger(__name__)
@@ -104,6 +109,27 @@ def _handle_npcap_missing(parent) -> str:
     return action
 
 
+def _run_data_cleanup(pools, announcements) -> None:
+    """启动后异步数据清理（2026-10-10）：静默执行、只写日志、无用户可见反馈。
+
+    - 公告已读记录：公告列表已不存在的 id 清掉（列表为空则跳过——失败与
+      真·空列表无法区分，避免误删全部已读）；
+    - 陌生卡池指派：元数据已收录的池，其指派条目清掉（指派本就只对未收录
+      池生效，收录后失效，清掉属纯文件卫生）。
+
+    跑在 daemon 线程，失败只告警不影响启动/运行。公告读写与 GUI 线程的
+    mark_read 之间有模块级锁互斥（announcements._READ_LOCK）。
+    """
+    try:
+        cleanup_read_ids({a.id for a in announcements})
+    except Exception:
+        logger.warning("公告已读清理失败（忽略）", exc_info=True)
+    try:
+        cleanup_pool_assignments(pools)
+    except Exception:
+        logger.warning("陌生池指派清理失败（忽略）", exc_info=True)
+
+
 class _InitWorker(QThread):
     """启动初始化后台线程（第二批 E）。
 
@@ -129,6 +155,12 @@ class _InitWorker(QThread):
             characters, pools, pity_groups, remote_ok = load_role_data()
             announcements = load_announcements()
             version_info = load_version_info()
+
+            # 数据清理：远程数据已就绪，后台异步静默清失效数据（daemon 线程，
+            # 不阻塞初始化，也不等待完成）
+            threading.Thread(
+                target=_run_data_cleanup, args=(pools, announcements), daemon=True
+            ).start()
 
             self.step.emit("准备账号档案…")
             profiles = ProfileManager()
@@ -179,10 +211,38 @@ def _prewarm_lazy_deps() -> None:
 
 def main() -> int:
     """主函数。"""
+    # 自动重启（源码态；冻结态由 packaging/bootstrap.py 更早处理）：
+    # 等旧进程退出后再继续，避免双开抢网卡/数据文件。
+    if not getattr(sys, "frozen", False):
+        from .utils.restart import (
+            parse_restart_pid,
+            strip_restart_flag,
+            wait_for_exit,
+        )
+
+        _old_pid = parse_restart_pid(sys.argv[1:])
+        if _old_pid is not None:
+            wait_for_exit(_old_pid)
+            sys.argv = [sys.argv[0]] + strip_restart_flag(sys.argv[1:])
+
     # 迁移旧平铺布局到子目录（须早于 setup_logging，避免 app.log 句柄占用导致移动失败）
     migrate_legacy_flat_files()
 
     setup_logging()
+
+    # 启动器能力/已挂载组件：实机排查“识别开关开着却没反应”的第一现场。
+    api = host_env.bootstrap_api()
+    mounted = runtime_pack.mounted_modules()
+    logger.info(
+        "启动器能力：bootstrap api=%s，exe=%s，legacy=%s；已挂载组件=%s；视觉识别可用=%s",
+        api,
+        host_env.exe_version(),
+        host_env.is_legacy_launcher(),
+        ", ".join(
+            f"{name} {info.get('version', '?')}" for name, info in mounted.items()
+        ) or "无",
+        features.available("recognition"),
+    )
 
     # 确保用户数据目录存在
     get_data_dir()
@@ -276,6 +336,7 @@ def _on_init_done(app, splash, result: dict) -> None:
 
     window = MainWindow(characters, pools, pity_groups, profiles)
     _main_window = window  # 持强引用，防槽返回后窗口被回收销毁（见模块顶部注释）
+    window.set_version_info(version_info)  # 供「视觉识别组件…」手动检查
 
     # 强制更新同步闸门（建窗后、show 前）：上轮拒绝强更 -> 本轮启动直接禁用
     # 「开始抓包」（仍可查看历史/导出；后续版本检查到已最新会解除）。
@@ -289,6 +350,19 @@ def _on_init_done(app, splash, result: dict) -> None:
     # 后台预热懒加载的重依赖（scapy ~3s / openpyxl ~0.2s）：窗口已可见即可
     # 交互，首次「开始抓包」/导出时命中最热，不再现导（见 _prewarm_lazy_deps）。
     threading.Thread(target=_prewarm_lazy_deps, daemon=True).start()
+
+    # 功能组件：清理各模块旧版本（当前版本已被本进程加载，旧版本此时未占用，
+    # 可安全删除；失败忽略，下次启动再试）。
+    def _cleanup_runtime_versions() -> None:
+        try:
+            removed = runtime_pack.cleanup_old_versions()
+            if removed:
+                logger.info(f"已清理 {removed} 个旧组件版本目录")
+        except Exception as e:  # noqa: BLE001 —— 清理失败不影响启动
+            logger.warning(f"清理旧组件版本失败（忽略）: {e}")
+
+    threading.Thread(target=_cleanup_runtime_versions, daemon=True).start()
+    window.show_runtime_hint()
 
     # Npcap 依赖检测：抓包强依赖该开源组件。未安装/不可用时弹依赖说明，
     # 用户选「安装随包」/「前往官网」则拉起安装流程后退出（安装完成需重启本程序），
@@ -339,6 +413,49 @@ def _on_init_done(app, splash, result: dict) -> None:
             UpdateDialog(info, mode="prompt", parent=window).exec()
 
     QTimer.singleShot(0, _maybe_check_update)
+
+    # 功能组件强制检查：排在版本弹窗之后；有模态框时延后重试，避免叠弹窗。
+    # 只检查「已开启功能」所需的模块；缺失/有更新时必须处理——卡池识别可
+    # 停用后跳过（若不再被其他功能需要），练度识别不可停用。安装成功后立即
+    # 自动重启；下载失败才允许「继续运行，该功能暂不可用」，下次启动再强制。
+    # 离线（version_info 缺失）或旧壳不强制，避免把用户卡在启动阶段。
+    def _maybe_prompt_runtime(retries: int = 0) -> None:
+        if version_info is None:
+            return
+        if host_env.is_legacy_launcher():
+            # 旧壳不支持 runtime 挂载：绝不自动下载（装完也不会生效）
+            return
+        modules = features.enabled_modules()
+        if not modules:
+            return
+        # 抓包中禁止更新组件（安装成功会立即重启，不能打断抓取）：先等用户停止
+        if window.worker and window.worker.isRunning():
+            if retries < 20:
+                QTimer.singleShot(1500, lambda: _maybe_prompt_runtime(retries + 1))
+            return
+        if QApplication.activeModalWidget() is not None:
+            if retries < 20:
+                QTimer.singleShot(1500, lambda: _maybe_prompt_runtime(retries + 1))
+            return
+        try:
+            if not pending_modules(version_info, modules):
+                return
+            dialog = RuntimeUpdateDialog(
+                version_info, manual=False, modules=modules, parent=window,
+                force=True,
+            )
+            dialog.exec()
+            if dialog.disabled_features:
+                window.apply_disabled_features(dialog.disabled_features)
+            if dialog.restart_requested:
+                window.restart_for_runtime_update()
+            elif dialog.exit_requested:
+                window.close()
+                app.quit()
+        except Exception as e:  # noqa: BLE001 —— 组件检查失败不影响主程序
+            logger.warning(f"功能组件检查失败（忽略）: {e}")
+
+    QTimer.singleShot(1500, _maybe_prompt_runtime)
 
     # 启动时主动检查当前账号是否有抽卡地址（问题反馈 6：地址因账号而异，
     # 缺失时提前引导获取，而不是抓不到才提示）。排在公告/更新之后，避免

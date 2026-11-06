@@ -21,10 +21,16 @@ from typing import Optional
 # 消息类型（帧体 2B 大端）
 MSG_GACHA = 0x000C      # 抽卡记录请求/响应
 MSG_HEARTBEAT = 0x0001  # 心跳（C->S 9B / S->C 15B）
+MSG_HERO_SUMMARY = 0x0038  # 角色概要推送（映像三等级+词条库序号，全部角色翻页触发）
 
 # 扩展 ID / 模块分类（帧体 2B 大端）
 EXT_GACHA = 0x0800
 EXT_HEARTBEAT = 0x0200
+# MSG_GACHA 下的角色练度帧（事件驱动推送，见 example-key-dump-research 仓 材料/角色数据解析脚本/角色数据解析指南.md §3（2026-10-18 迁移））
+EXT_SKILL_UPDATE = 0x0300  # 技能等级更新（F1=角色/F2=技能复合 id/F3=新等级）
+EXT_HERO_FULL = 0x0301     # 英雄全量块（F1=角色/F2=等级/F4=叠卡）
+EXT_PLAYER_INFO = 0x0900   # 玩家信息（F9 重复组=批量英雄概要）
+EXT_POOL_DIRECTORY = 0x0B00  # 卡池目录（S->C 登录连接自动下发，切视图不触发——兜底方案 F7）
 
 # S->C result（2B 大端）
 RESULT_OK = 0

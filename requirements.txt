@@ -3,5 +3,12 @@ scapy>=2.5.0
 openpyxl>=3.1.0
 requests>=2.31.0
 cryptography>=41.0.0
+# 卡池识别（契约记录页本机 OCR，2026-10-21）：只在本机跑，不上传
+rapidocr_onnxruntime>=1.4.4
+onnxruntime>=1.17.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+# 截屏回退后端（Qt 抓屏失败/黑帧时按物理像素抓屏）
+mss>=9.0.1
 pyinstaller>=6.0.0
 pytest>=7.0.0

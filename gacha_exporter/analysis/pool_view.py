@@ -405,6 +405,24 @@ class PoolViewTracker:
     #         return 0
     #     return self._view_direction.get(view, 0)
 
+    def latest_response_context(self, body: bytes) -> Optional[Tuple[str, int, int]]:
+        """返回正常响应所属的 (view, offset, total)；非抽卡响应/被拒返回 None。
+
+        与 `resolve_view` 同样先按响应回显 seq 配对，未登记时回退当前视图。
+        供卡池识别做页号校验（offset//5+1 对应截图页码）。
+        """
+        parsed = parse_pool_response(body)
+        if parsed is None:
+            return None
+        seq, offset, total, rejected = parsed
+        if rejected or total <= 0:
+            return None
+        req = self._seq_to_req.get(seq)
+        view = req[0] if req is not None else self._current_view
+        if view is None:
+            return None
+        return view, offset, total
+
     def resolve_view(self, body: bytes) -> Optional[str]:
         """由响应帧回显的 seq 查出该页所属视图。
 

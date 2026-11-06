@@ -5,5 +5,5 @@
 
 # 工具版本号唯一源：版本更新检查（打包更新说明 §4.1）以此为当前版本基准，
 # pyproject.toml 的 version 字段须与之保持一致。发布新版本时同步修改。
-__version__ = "0.4.0"
+__version__ = "1.0.0"
 __author__ = "klascher"

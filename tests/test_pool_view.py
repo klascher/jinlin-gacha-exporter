@@ -360,6 +360,30 @@ def test_resolve_view_none_when_no_request_seen():
     body = _build_response(seq=0x3A, total=10, simple_body=False)
     assert tracker.resolve_view(body) is None
 
+
+def test_latest_response_context_normal():
+    """正常响应返回 (view, offset, total)，供卡池识别校验页号。"""
+    tracker = PoolViewTracker()
+    tracker.track_request(_build_request(0x3A, 0, 5))
+    body = _build_response(seq=0x3A, total=887, offset=5, simple_body=False)
+    assert tracker.latest_response_context(body) == ("0", 5, 887)
+
+
+def test_latest_response_context_rejected_is_none():
+    """被限流拒绝的响应没有 offset/total，不得产生识别任务。"""
+    tracker = PoolViewTracker()
+    tracker.track_request(_build_request(0x3A, 0, 0))
+    assert tracker.latest_response_context(_build_response(seq=0x3A)) is None
+
+
+def test_latest_response_context_falls_back_current_view():
+    """请求漏抓时回退当前视图；当前视图未知返回 None。"""
+    tracker = PoolViewTracker()
+    body = _build_response(seq=0x7F, total=10, offset=0, simple_body=False)
+    assert tracker.latest_response_context(body) is None
+    tracker.track_request(_build_request(0x3A, 20001, 0))
+    assert tracker.latest_response_context(body) == ("20001", 0, 10)
+
 # ---- 长会话 seq%%127 回绕配对（2026-08-18 结构化重构回归） ----
 # capture_20260817_214949.pcap（seq 到 424）逐帧验证：counter/seq 回显 =
 # seq %% 127（127->0x00、128->0x01、298->0x2c）。曾用 seq & 0xFF 配对，

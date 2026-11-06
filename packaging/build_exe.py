@@ -3,13 +3,16 @@
 瘦身架构（见 打包更新说明）：
 - 入口为 bootstrap.py（含 PySide6 + app.zip 状态机），业务逻辑在 app.zip
 - --exclude-module gacha_exporter 级联排除业务包（exe 永不更新）
-- zip 内代码动态 import 的第三方库（scapy/openpyxl/requests）静态分析看不到，
-  必须 --hidden-import 显式带上
+- zip 内代码动态 import 的第三方库（scapy/openpyxl/requests）静态分析
+  看不到，必须 --hidden-import 显式带上
+- OCR 栈（numpy/cv2/onnxruntime/rapidocr）不进 exe：由同目录 runtime/
+  独立发布（build_runtime.py），bootstrap 启动时挂 sys.path + DLL 目录
 - 本脚本只负责 exe；app.zip 由 build_app_zip.py 生成（两者同放 dist/ 发布）
 """
 import os
 import shutil
 import sys
+import sysconfig
 
 import PyInstaller.__main__
 
@@ -67,6 +70,35 @@ def _prepare_icon() -> str | None:
         return None
 
 
+# 被 runtime 外部依赖间接使用、但业务包静态图里不出现的标准库子模块。
+# PyInstaller 只收集静态可达模块；把标准库整体作为超集钉进 exe（纯 pyc，
+# 实测 69→76MB），换取「runtime 里任意新依赖都能找到标准库」的稳定性。
+# 排除项都是 GUI/开发/测试用途，OCR/数值依赖不会触达。
+_STDLIB_EXCLUDES = {
+    "tkinter", "idlelib", "turtle", "turtledemo", "test", "ensurepip",
+    "lib2to3", "venv", "antigravity", "this", "__phello__", "pydoc_data",
+}
+
+
+def _stdlib_hidden_imports() -> list[str]:
+    names = getattr(sys, "stdlib_module_names", ())
+    if not names:  # 理论不会发生（构建固定 Py3.11）；退化为不追加
+        return []
+    return sorted(n for n in names if n not in _STDLIB_EXCLUDES)
+
+
+def _python3_dll() -> str | None:
+    """稳定 ABI 转发层 python3.dll（cv2 5.x 等 wheel 链接它，而非 python311.dll）。
+
+    实测缺失时外部 cv2 import 报「DLL load failed: 找不到指定的模块」。
+    """
+    stdlib_dir = sysconfig.get_paths().get("stdlib")
+    if not stdlib_dir:
+        return None
+    path = os.path.join(os.path.dirname(stdlib_dir), "python3.dll")
+    return path if os.path.isfile(path) else None
+
+
 def build() -> int:
     """执行 PyInstaller 打包。"""
     clean()
@@ -100,10 +132,24 @@ def build() -> int:
         # 仅 zip 内代码引用、标准库纯 py 模块，静态分析看不到也不被其它依赖传递带入
         #（2026-10-08 实测缺失 → 启动即 ModuleNotFoundError，弹「app.zip 损坏」）
         "--hidden-import", "webbrowser",
+        # 截屏回退（Qt 失败/黑帧时用）：mss 只在 zip 内代码里动态 import
+        "--hidden-import", "mss",
+        "--hidden-import", "mss.tools",
+        # OCR 栈不再进 exe（2026-10-21）：由 runtime/ 独立更新，见 build_runtime.py。
+        # 但外部包会用到业务包静态图之外的标准库模块，必须把标准库超集带上。
         "--distpath", DIST_DIR,
         "--workpath", BUILD_DIR,
         "--specpath", PROJECT_ROOT,
     ]
+
+    for name in _stdlib_hidden_imports():
+        args += ["--hidden-import", name]
+
+    python3_dll = _python3_dll()
+    if python3_dll:
+        args += ["--add-binary", f"{python3_dll}{os.pathsep}."]
+    else:
+        print("警告：未找到 python3.dll，外部 cv2 可能在运行时加载失败")
 
     PyInstaller.__main__.run(args)
     return 0

@@ -1,7 +1,11 @@
 """数据模型 — 抽卡记录、角色、卡池、会话上下文、异常。"""
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+_RUNTIME_MODULE_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+_RUNTIME_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,9 @@ class Character:
     name: str
     rarity: int
     limited: bool = False
+    # 专属词条库（库序→名称+档位），来自 data/role-image.json（load_role_data
+    # 装配）；缺失 = 无翻译表，练度展示回退 #序号（见 roster_capture.translate_entries）
+    lib: Optional[List[dict]] = None
 
     @classmethod
     def default(cls, item_id: str) -> "Character":
@@ -165,6 +172,29 @@ class Announcement:
 
 
 @dataclass(frozen=True)
+class RuntimeInfo:
+    """一个外部功能组件模块（runtime）的下发信息。
+
+    模块按重依赖边界拆开（``ocr`` / ``training`` / ``team_builder``），各自
+    独立版本/地址/哈希/签名，只有变化的模块才会被客户端下载。
+    ``requires`` 声明依赖模块（安装/挂载前须就绪）。
+    """
+
+    module: str
+    version: str = ""
+    url: str = ""
+    sha256: str = ""
+    signature: str = ""
+    size: int = 0
+    requires: Tuple[str, ...] = ()
+    label: str = ""
+
+    def display_name(self) -> str:
+        """展示名：服务端 label 优先，其次模块名。"""
+        return self.label or self.module
+
+
+@dataclass(frozen=True)
 class VersionInfo:
     """服务端下发的工具最新版本信息。
 
@@ -173,6 +203,7 @@ class VersionInfo:
     （提示不强制）/ force（强制，拒绝则禁用抓包）；
     update_url 为逻辑补丁 zip（full_exe=False）或新 exe 下载地址（full_exe=True）；
     update_sha256 为补丁期望哈希（配合 HMAC 鉴权响应防篡改）；
+    runtimes 为外部功能组件模块表（模块名 -> RuntimeInfo），空表 = 不更新；
     ts 为 Unix 秒时间戳（排序/展示用）。
     """
 
@@ -183,7 +214,12 @@ class VersionInfo:
     update_sha256: str = ""
     update_signature: str = ""
     full_exe: bool = False
+    runtimes: Dict[str, RuntimeInfo] = field(default_factory=dict)
     ts: int = 0
+
+    def runtime(self, module: str) -> Optional[RuntimeInfo]:
+        """按模块名取组件信息；未配置返回 None。"""
+        return self.runtimes.get(module)
 
 
 class DataNotReadyError(Exception):
@@ -194,7 +230,11 @@ class DataNotReadyError(Exception):
 
 
 def parse_character(item_id: str, data: Dict[str, Any]) -> Character:
-    """从 JSON dict 构造 Character。"""
+    """从 JSON dict 构造 Character。
+
+    词条库不随 role.json（走独立文件 role-image.json，见 loaders/role_image），
+    lib 保持 None 由 load_role_data 装配。
+    """
     return Character(
         id=item_id,
         name=data.get("name", f"未知({item_id})"),
@@ -248,13 +288,53 @@ def parse_announcement(aid: str, data: Dict[str, Any]) -> Announcement:
     )
 
 
+def _parse_runtime_info(module: str, data: Any) -> Optional[RuntimeInfo]:
+    """解析单个 runtime 模块项；缺版本号/版本格式非法返回 None。"""
+    if not isinstance(data, dict):
+        return None
+
+    def _str(key: str) -> str:
+        value = data.get(key, "")
+        return value.strip() if isinstance(value, str) else ""
+
+    version = _str("version")
+    if not version or not _RUNTIME_VERSION_RE.match(version) or version in (".", ".."):
+        return None
+    size = data.get("size", 0)
+    if not isinstance(size, int) or isinstance(size, bool):
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            size = 0
+    if size < 0:
+        size = 0
+    requires_raw = data.get("requires", ())
+    requires: Tuple[str, ...] = ()
+    if isinstance(requires_raw, (list, tuple)):
+        requires = tuple(
+            name for name in requires_raw
+            if isinstance(name, str) and _RUNTIME_MODULE_RE.match(name)
+        )
+    return RuntimeInfo(
+        module=module,
+        version=version,
+        url=_str("url"),
+        sha256=_str("sha256"),
+        signature=_str("signature"),
+        size=size,
+        requires=requires,
+        label=_str("label"),
+    )
+
+
 def parse_version_info(data: Dict[str, Any]) -> VersionInfo:
     """从服务端 /version 响应 dict 构造 VersionInfo。
 
     latest_version 必填（缺失视为无效，调用方应判空后按"无更新"处理）；
     其余字段逐个校验 + 缺省：update_type 非法 -> "prompt"（默认提示不强制），
     update_url 非 str -> ""，update_sha256 非 str -> ""，update_signature 非 str -> ""，
-    full_exe 非 bool -> False。
+    full_exe 非 bool -> False；runtimes 为模块名 -> 组件项映射，非法模块名/
+    缺版本号的条目直接跳过；旧单模块字段 runtime_* 兼容映射为 ocr 模块。
     """
     latest = data.get("latest_version", "")
     if not isinstance(latest, str) or not latest:
@@ -277,6 +357,30 @@ def parse_version_info(data: Dict[str, Any]) -> VersionInfo:
     full_exe = data.get("full_exe", False)
     if not isinstance(full_exe, bool):
         full_exe = False
+
+    runtimes: Dict[str, RuntimeInfo] = {}
+    raw_runtimes = data.get("runtimes")
+    if isinstance(raw_runtimes, dict):
+        for name, item in raw_runtimes.items():
+            if not isinstance(name, str) or not _RUNTIME_MODULE_RE.match(name):
+                continue
+            parsed = _parse_runtime_info(name, item)
+            if parsed is not None:
+                runtimes[name] = parsed
+    # 兼容旧单模块字段（runtime_version/... 视作 ocr 模块）
+    if "ocr" not in runtimes:
+        legacy_version = data.get("runtime_version", "")
+        if isinstance(legacy_version, str) and legacy_version.strip():
+            legacy = _parse_runtime_info("ocr", {
+                "version": legacy_version,
+                "url": data.get("runtime_url", ""),
+                "sha256": data.get("runtime_sha256", ""),
+                "signature": data.get("runtime_signature", ""),
+                "size": data.get("runtime_size", 0),
+            })
+            if legacy is not None:
+                runtimes["ocr"] = legacy
+
     ts = data.get("ts", 0)
     if not isinstance(ts, int):
         try:
@@ -291,5 +395,6 @@ def parse_version_info(data: Dict[str, Any]) -> VersionInfo:
         update_sha256=sha,
         update_signature=signature,
         full_exe=full_exe,
+        runtimes=runtimes,
         ts=ts,
     )
